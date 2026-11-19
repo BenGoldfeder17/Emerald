@@ -14,66 +14,61 @@ by [BenGoldfeder17](https://github.com/BenGoldfeder17).
 Based on Basalt commit [`63cb68ad`](https://github.com/jesdga95/basalt/commit/63cb68ad471a443811ae171da0395bc3f1fc3ab5) of 2026-11-18. Basalt's own
 documentation is kept in [`docs/`](docs/) and applies here except where this page says otherwise.
 
+## Speed against LM Studio
+
+The same RTX Spark N1X laptop, the same prompts, Qwen3.8-27B in both:
+
+| | Emerald | LM Studio |
+|---|---|---|
+| Essay, temperature 0.6 | 39.1 tok/s | 24.1 tok/s |
+| Code, temperature 0 | 70.3 tok/s | 38.4 tok/s |
+| First read of an 8,800-token prompt | 2.9 s | 11.3 s |
+| Time to first token of a tool call | 0.4 s | 0.7 to 1.4 s |
+
+This compares speed, not answer quality: the two run different 4-bit forms of the model. Emerald ran the NVFP4 pack with
+Basalt's drafting and the config below; LM Studio ran the Q4_K_S GGUF on its llama.cpp CUDA runtime. Both had a 32,768-token
+context and thinking off, and each figure is the mean of two runs. More in [Measured on the N1X](#measured-on-the-n1x).
+
 ## Status
 
 | | |
 |---|---|
 | Works | Qwen3.8-27B (`Qwen3.8-27B-QUASAR-NVFP4.basalt`, with its DFlash 2 drafter): every weight on the GPU, context up to the model's 262,144 tokens, `basalt serve` with the OpenAI-compatible API, tool calls, the conversation cache. |
-| Not available | Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash. They keep their experts in system RAM and compute them with x86 (AVX2, AVX-512) kernels; on ARM64 those kernels are stubs that stop with a message. |
+| Not available | Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash. They keep their experts in system RAM and compute them with x86 (AVX2, AVX-512) kernels; on ARM64 those kernels are stubs that stop with a message. [Other N1X ports](#other-n1x-ports-of-basalt) run Flash-Next. |
 | Not tested | Image and video input, more than one GPU, and Basalt's own test suite and quality gate (perplexity and KLD), none of which have been run on ARM64. |
 
 Everything here was built and measured on one laptop. Please report problems with this port in this repository, not upstream.
 
-## Requirements
+## Quick start with the prebuilt download
 
-- An RTX Spark laptop with the N1X chip, running Windows 11 on Arm, with a current NVIDIA driver (621.24 was used).
-- Enough GPU memory for the model and its context. The N1X divides its unified memory between Windows and the GPU. On the
-  test machine (64 GB) the GPU memory in use while generating, with the Windows desktop and other running apps included,
-  was about 25 GiB at a 32,768-token context and about 32 GiB at the full 262,144, both with `"kv": "int8"`.
-- Visual Studio 2026 Build Tools with the MSVC ARM64 toolset (19.51 was used) and a Windows SDK, CMake 3.24 or newer, Ninja,
-  and an ARM64 Python 3.10 or newer (3.13 was used; every wheel in `requirements.txt` installed prebuilt).
-- The CUDA 13 toolkit for `windows-arm64`. NVIDIA publishes it as archives at
-  <https://developer.download.nvidia.com/compute/cuda/redist/>; no installer is needed. Release 13.4.2 was used, with these
-  packages unpacked into one folder so that their `bin`, `include` and `lib` directories merge: `cuda_nvcc`, `cuda_cudart`,
-  `cuda_crt`, `libnvvm`, `libnvptxcompiler`, `cccl`, `libcublas`, `libnvjitlink`, `cuda_nvrtc`, `cuda_nvml_dev`, `cuda_nvtx`
-  and `cuda_profiler_api`.
+No compiler is needed. You need an RTX Spark laptop with the N1X chip running Windows 11 on Arm, a current NVIDIA driver
+(621.24 was used), an ARM64 Python 3.10 or newer, and about 25 GB of free disk for the model.
 
-## Build
+1. Download `emerald-v0.1.0-windows-arm64.zip` from [Releases](https://github.com/BenGoldfeder17/Emerald/releases/latest) and
+   unzip it. The executables are not code-signed.
+2. Add NVIDIA's cuBLAS library, which the engine loads at start. Download the `libcublas` archive from
+   <https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-arm64/> (13.8.0.4 was used) and copy
+   `cublas64_13.dll` and `cublasLt64_13.dll` from its `bin\arm64` folder into the unzipped folder's `bin`, beside `basalt.exe`.
+3. In a command prompt in the unzipped folder, set up the server's Python environment and download the model pack (21 GB)
+   from the Basalt author's Hugging Face repository:
 
-From a command prompt, with the CUDA folder at `C:\cuda-13.4.2` (change both paths to match your machine):
+   ```bat
+   py -3 -m venv .venv
+   .venv\Scripts\pip install -r requirements.txt huggingface_hub
+   .venv\Scripts\hf download jesdga/Qwen3.8-27B-Basalt Qwen3.8-27B-QUASAR-NVFP4.basalt --local-dir models
+   ```
 
-```bat
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" arm64
-set "CUDA_PATH=C:\cuda-13.4.2"
-set "PATH=%CUDA_PATH%\bin;%CUDA_PATH%\bin\arm64;%PATH%"
+4. Start it:
 
-git clone https://github.com/BenGoldfeder17/Emerald emerald
-cd emerald
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBASALT_MODELS=qwen35 -DBASALT_CUDA_ARCH=121 ^
-  "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%/bin/nvcc.exe" "-DCUDAToolkit_ROOT=%CUDA_PATH%" ^
-  "-DCUDAToolkit_LIBRARY_DIR=%CUDA_PATH%/lib/arm64"
-cmake --build build -j 6
-```
+   ```bat
+   bin\basalt.exe serve --config basalt_config.json
+   ```
 
-The build takes about two minutes and the executables land in `bin\`. Two build settings carry the port:
+The model loads in about 12 seconds. The API is then at `http://127.0.0.1:8080/v1` and the web UI at `http://127.0.0.1:8080/`.
+If Windows reports that `MSVCP140.dll` or `VCRUNTIME140.dll` is missing, install Microsoft's
+[Visual C++ Redistributable for ARM64](https://aka.ms/vc14/vc_redist.arm64.exe).
 
-- `-DBASALT_CUDA_ARCH=121` builds for compute capability 12.1 (the default, 120, is upstream's target). The start refuses a
-  GPU of the other capability.
-- ARM64 is detected from the host: the x86 CPU kernels are left out and stubs stand in for them. Only the dense model has
-  been built and run, hence `-DBASALT_MODELS=qwen35`.
-
-## Run
-
-Set up the server's Python environment and download the model pack (21 GB) from the Basalt author's Hugging Face repository
-(the `hf` command comes with `pip install huggingface_hub`):
-
-```bat
-py -3 -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-hf download jesdga/Qwen3.8-27B-Basalt Qwen3.8-27B-QUASAR-NVFP4.basalt --local-dir models
-```
-
-Put the settings in `basalt_config.json`:
+The download carries this `basalt_config.json`, the configuration used on the test laptop:
 
 ```json
 {
@@ -91,19 +86,47 @@ Put the settings in `basalt_config.json`:
 }
 ```
 
-This is the configuration used on the test laptop. `max-context` can be raised to 262144 when the GPU memory allows it. The
-two `conversation-cache` entries keep earlier conversations in RAM and on disk, so returning to one does not read it again.
+- **GPU memory:** the N1X divides its unified memory between Windows and the GPU. On the test machine (64 GB) the GPU memory
+  in use while generating, with the Windows desktop and other running apps included, was about 25 GiB at this 32,768-token
+  context and about 32 GiB at the model's full 262,144 (`"max-context": 262144`), both with `"kv": "int8"`.
+- **Conversation cache:** the two `conversation-cache` entries keep earlier conversations in RAM and on disk, so returning
+  to one does not read it again.
+- **Everything else:** Basalt's [configuration](docs/configuration/index.md) and [Qwen3.8-27B](docs/models/qwen38-27b.md) pages.
 
-Start it with the CUDA runtime libraries on the path:
+## Build from source
+
+Besides the above you need:
+
+- Visual Studio 2026 Build Tools with the MSVC ARM64 toolset (19.51 was used) and a Windows SDK, CMake 3.24 or newer and Ninja.
+- The CUDA 13 toolkit for `windows-arm64`. NVIDIA publishes it as archives at
+  <https://developer.download.nvidia.com/compute/cuda/redist/>; no installer is needed. Release 13.4.2 was used, with these
+  packages unpacked into one folder so that their `bin`, `include` and `lib` directories merge: `cuda_nvcc`, `cuda_cudart`,
+  `cuda_crt`, `libnvvm`, `libnvptxcompiler`, `cccl`, `libcublas`, `libnvjitlink`, `cuda_nvrtc`, `cuda_nvml_dev`, `cuda_nvtx`
+  and `cuda_profiler_api`.
+
+From a command prompt, with the CUDA folder at `C:\cuda-13.4.2` (change both paths to match your machine):
 
 ```bat
-set "PATH=C:\cuda-13.4.2\bin\arm64;%PATH%"
-bin\basalt.exe serve --config basalt_config.json
+call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" arm64
+set "CUDA_PATH=C:\cuda-13.4.2"
+set "PATH=%CUDA_PATH%\bin;%CUDA_PATH%\bin\arm64;%PATH%"
+
+git clone https://github.com/BenGoldfeder17/Emerald emerald
+cd emerald
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBASALT_MODELS=qwen35 -DBASALT_CUDA_ARCH=121 ^
+  "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%/bin/nvcc.exe" "-DCUDAToolkit_ROOT=%CUDA_PATH%" ^
+  "-DCUDAToolkit_LIBRARY_DIR=%CUDA_PATH%/lib/arm64"
+cmake --build build -j 6
 ```
 
-The model loads in about 12 seconds. The API is then at `http://127.0.0.1:8080/v1` and the web UI at `http://127.0.0.1:8080/`.
-Every other setting is described in Basalt's [configuration](docs/configuration/index.md) and
-[Qwen3.8-27B](docs/models/qwen38-27b.md) pages.
+The build takes about two minutes and the executables land in `bin\`. Then follow the quick start from step 3; the repository
+carries the same `basalt_config.json`, and with `%CUDA_PATH%\bin\arm64` on the path step 2 is not needed. Two build settings
+carry the port:
+
+- `-DBASALT_CUDA_ARCH=121` builds for compute capability 12.1 (the default, 120, is upstream's target). The start refuses a
+  GPU of the other capability.
+- ARM64 is detected from the host: the x86 CPU kernels are left out and stubs stand in for them. Only the dense model has
+  been built and run, hence `-DBASALT_MODELS=qwen35`.
 
 ## Options for the N1X
 
@@ -121,17 +144,17 @@ checkpoints are on for the dense model; `--prompt-cache-every 0` turns them off.
 
 ## Measured on the N1X
 
-One RTX Spark N1X laptop with 64 GB of unified memory, 32,768-token context, `"kv": "int8"`, thinking off. The left column is
-the port alone, which behaves like upstream Basalt. The right column adds the periodic checkpoints and `relaxed-drafting 0.2`
-for the dense model.
+One RTX Spark N1X laptop with 64 GB of unified memory, 32,768-token context, `"kv": "int8"`, thinking off, two runs each.
+The first column is the port alone, which behaves like upstream Basalt. The second adds the periodic checkpoints and
+`relaxed-drafting 0.2` for the dense model. The third is LM Studio with the Q4_K_S GGUF of the same model.
 
-| | Port alone | With checkpoints and relaxed drafting |
-|---|---|---|
-| Essay, temperature 0.6 | 34.2 tok/s | 39.1 tok/s |
-| Code, temperature 0 | 68.8 tok/s | 70.3 tok/s |
-| First read of an 8,800-token prompt | 2.65 s | 2.88 s |
-| New question about that prompt | 2.66 s | 0.33 s |
-| Time to first token of a tool call | 0.39 s | 0.41 s |
+| | Port alone | With checkpoints and relaxed drafting | LM Studio |
+|---|---|---|---|
+| Essay, temperature 0.6 | 34.2 tok/s | 39.1 tok/s | 24.1 tok/s |
+| Code, temperature 0 | 68.8 tok/s | 70.3 tok/s | 38.4 tok/s |
+| First read of an 8,800-token prompt | 2.65 s | 2.88 s | 11.3 s |
+| New question about that prompt while it is cached | 2.66 s | 0.33 s | 0.5 to 0.9 s |
+| Time to first token of a tool call | 0.39 s | 0.41 s | 0.7 to 1.4 s |
 
 - `embedding-gpu` and `gpu-wait lazy` were added afterwards and did not change these speeds: with all four on, the essay ran
   at 38 to 41 tok/s.
@@ -139,6 +162,21 @@ for the dense model.
 - Speeds fall by about 5% as the laptop warms up over back-to-back runs.
 - At the full 262,144-token context a 212,000-token prompt was read cold in 171 s and answered correctly; generation speed
   was the same as at 32,768.
+
+## Other N1X ports of Basalt
+
+Emerald is not the only one. Two others were offered to Basalt, which does not take platforms its author cannot test:
+
+- [SolettaSolaris/basalt](https://github.com/SolettaSolaris/basalt/tree/arm64-n1x)
+  ([pull request 230](https://github.com/jesdga95/basalt/pull/230)): Windows on Arm64 with NEON CPU kernels, so it also runs
+  Qwen3.8-Flash-Next.
+- [yanmindi/basalt-arm-sm121](https://github.com/yanmindi/basalt-arm-sm121)
+  ([pull request 450](https://github.com/jesdga95/basalt/pull/450)): Windows and Linux on Arm64 with NEON CPU kernels,
+  Flash-Next and the 27B, measured on a 128 GB N1X.
+
+Both cover more of Basalt than Emerald does; for Flash-Next or Linux, use one of them. Emerald is for running Qwen3.8-27B on
+Windows with the least setup: a prebuilt download (neither of the others had one in November 2026), the N1X options above
+and measurements from a 64 GB laptop. It shares no code with either.
 
 ## Credits
 
