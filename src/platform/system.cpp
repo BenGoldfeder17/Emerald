@@ -5,6 +5,7 @@
 #include "basalt/platform/process.hpp"
 
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,7 @@
 #else
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -237,5 +239,26 @@ ThreadWaits threads_in_disk_wait() {
 }
 
 #endif
+
+void sleep_precise(int64_t micros) {
+    if (micros <= 0) return;
+#if defined(_WIN32)
+    // a high-resolution waitable timer per thread (Windows 10 1803+): Sleep() rounds up to the system tick, 15.6 ms
+    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                                       TIMER_ALL_ACCESS);
+    if (timer != nullptr) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(micros * 10);   // relative, in 100 ns
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(timer, INFINITE);
+            return;
+        }
+    }
+    Sleep((DWORD) ((micros + 999) / 1000));
+#else
+    timespec ts{(time_t) (micros / 1000000), (long) (micros % 1000000) * 1000};
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+#endif
+}
 
 }  // namespace basalt::platform

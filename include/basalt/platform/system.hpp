@@ -78,4 +78,8 @@ ThreadWaits threads_in_disk_wait();
 /// started.
 std::optional<std::string> capture_output(const std::vector<std::string>& argv, bool include_stderr);
 
+/// Sleeps this thread for about `micros`, to a fraction of a millisecond where the OS has a high-resolution timer.
+/// For waits that something else then finishes: the length is approximate.
+void sleep_precise(int64_t micros);
+
 }  // namespace basalt::platform

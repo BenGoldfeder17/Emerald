@@ -45,6 +45,16 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
                            seen, choice.cards.size());
         return 2;
     }
+    // --gpu-wait: each chosen card's context is made here, first, with the schedule flag (later inits keep it)
+    if (o.gpu_wait != "auto" && o.gpu_wait != "lazy") {   // lazy: CUDA's own wait, after the model's sleeps
+        const unsigned flag = o.gpu_wait == "block" ? cudaDeviceScheduleBlockingSync
+                              : o.gpu_wait == "yield" ? cudaDeviceScheduleYield : cudaDeviceScheduleSpin;
+        for (int d = 0; d < (int) choice.cards.size(); ++d)
+            if (const cudaError_t e = cudaInitDevice(d, flag, cudaInitDeviceFlagsAreValid); e != cudaSuccess) {
+                basalt::log::warn("basalt", "--gpu-wait %s: CUDA%d kept its default wait (%s)", o.gpu_wait.c_str(), d, cudaGetErrorString(e));
+                (void) cudaGetLastError();
+            }
+    }
     bp::RoleInputs ri;
     for (int i : choice.cards) ri.cards.push_back((size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{});
     ri.max_expert_tiers = max_expert_tiers;   // the device-planned tail's peer windows

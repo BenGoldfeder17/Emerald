@@ -59,6 +59,12 @@ struct CommonOptions {
     /// page-locked RAM. For a machine whose GPU memory is its own pool beside the OS's RAM (the RTX Spark N1X's
     /// carve-out), where the page-locked copy takes RAM the system needs and the card has room to spare.
     bool embedding_gpu = false;
+    /// --gpu-wait auto|spin|yield|block|lazy: how a host thread waits for the GPU. auto, spin, yield and block are CUDA's
+    /// device schedule flags: auto spins a core for the whole of every wait when cores outnumber contexts; block sleeps
+    /// until the driver wakes the thread (RTX Spark N1X: a core at ~10% instead of 100% while decoding, 3 ms a round
+    /// slower). lazy (the dense models) keeps CUDA's wait but sleeps first through most of a wait whose length the
+    /// last ones foretell (a decode round, the block drafter, a full prompt chunk): the idle core without the latency.
+    std::string gpu_wait = "auto";
     /// --diag-split-at N: diagnostic, a dense model split across two cards at layer N whether or not it fits one (0: off)
     int diag_split_at = 0;
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),

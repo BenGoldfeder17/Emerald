@@ -6,11 +6,13 @@
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
+#include "basalt/platform/system.hpp"
 #include "basalt/program/expert_spill.hpp"
 #include "basalt/vision/encoder_cuda.hpp"
 #include "basalt/vision/preprocess.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -289,12 +291,40 @@ public:
         return {};
     }
 
+    // --gpu-wait lazy. A wait whose length the last ones foretell is slept through for most of it, and CUDA's own wait
+    // takes the rest: the core idles through a decode round instead of spinning for all of it, and the wait still ends
+    // when the work does. A sleep that outlasted the work (the stream is idle after it) shortens the next one.
+    struct Lazy {
+        double ms = 0.0;   // the wait's usual length, 0 while unknown
+    };
+    bool wait_stream(cudaStream_t s, Lazy& w) {
+        if (!m_.o.lazy_wait) return cudaStreamSynchronize(s) == cudaSuccess;
+        using Clock = std::chrono::steady_clock;
+        const Clock::time_point t0 = Clock::now();
+        bool overslept = false;
+        if (w.ms >= 3.0) {
+            platform::sleep_precise((int64_t) ((w.ms * 0.88 - 0.5) * 1000.0));
+            overslept = cudaStreamQuery(s) == cudaSuccess;
+            if (!overslept) (void) cudaGetLastError();   // "not ready" is no error to keep
+        }
+        const bool ok = cudaStreamSynchronize(s) == cudaSuccess;
+        if (overslept) w.ms *= 0.8;
+        else {
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            w.ms = w.ms == 0.0 ? ms : 0.7 * w.ms + 0.3 * ms;
+        }
+        return ok;
+    }
+    Lazy lazy_window_[kBatch + 1];   // a decode window's wait, by its rows
+    Lazy lazy_draft_;                // the block drafter's, at draft_end
+    Lazy lazy_chunk_[65];            // a full prompt chunk's, by where in the context it starts
+
     Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
         if (block_) {
             n = std::min(n_draft_, max_n);
             if (cudaMemcpyAsync(ids, st_.dids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
                 cudaMemcpyAsync(conf, st_.dconf, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
-                cudaStreamSynchronize(st_.stream) != cudaSuccess)
+                !wait_stream(st_.stream, lazy_draft_))
                 return fail(m_.o.arch + ": the block drafter failed");
             return {};
         }
@@ -331,7 +361,7 @@ public:
         if (r.logits) cudaMemcpyAsync(r.logits, st_.logits + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4,
                                       cudaMemcpyDeviceToHost, st_.stream);
         cudaMemcpyAsync(h_picks_, st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream);
-        if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        if (!wait_stream(st_.stream, lazy_window_[T])) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
         if (r.row_tokens) std::copy(h_picks_, h_picks_ + T, r.row_tokens);
         if (r.next_token) *r.next_token = h_picks_[T - 1];
         return {};
@@ -390,7 +420,7 @@ public:
             if (r.logits) cudaMemcpyAsync(r.logits, se.st_.logits + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, s);
             cudaMemcpyAsync(se.h_picks_, se.st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, s);
         }
-        if (cudaStreamSynchronize(s) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        if (!wait_stream(s, lazy_window_[rows])) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
         for (int i = 0; i < n; ++i) {
             Session& se = *ss[(size_t) i];
             const model::DecodeRequest& r = reqs[i];
@@ -421,7 +451,10 @@ public:
             for (int t = 0; t < n; ++t) pos3[(size_t) t * 3] = pos3[(size_t) t * 3 + 1] = pos3[(size_t) t * 3 + 2] = (int32_t) (p + t + st_.rope_delta);
             std::string err;
             if (!forward_chunk(m_, st_, r.tokens + at, nullptr, n, p, pos3.data(), err)) return fail(err);
-            if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+            // a full chunk's time depends on where it starts (attention reads the cells before it): a wait per place
+            Lazy other;
+            Lazy& lazy = n == kChunk ? lazy_chunk_[std::min<int64_t>(p / kChunk, 64)] : other;
+            if (!wait_stream(st_.stream, lazy)) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
             at += n;
             if (r.progress) r.progress(at);
             if (at < r.n_tokens && r.stop && r.stop()) break;

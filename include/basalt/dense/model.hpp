@@ -119,6 +119,7 @@ struct Options {
     uint64_t gpu_weight_bytes = 0;      ///< the weights the adapter put on the main card (its "GiB on the GPU" load figure, no KV cache)
     bool vision = false;                ///< requests may carry images
     bool kv_int8 = false;               ///< the attention layers' K/V as int8 codes with a scale per 64 values
+    bool lazy_wait = false;             ///< --gpu-wait lazy: sleep through most of a wait of known length (session.cpp)
     /// K/V streaming: each attention layer keeps its first kv_resident cells on the card and the rest in page-locked RAM,
     /// read over the bus by every decode window and staged to the card for each prompt chunk (0, or at least max_context:
     /// all on the card)

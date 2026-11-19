@@ -303,6 +303,7 @@ private:
             basalt::log::info("basalt qwen35", "layer split: %.2f GiB of layers %d-%d on CUDA%d", (double) peer_bytes_ / 1073741824.0, split_at_,
                               g.n_layers - 1, req.peer_devices.front());
         o.host_embedding_bytes = embd_dev_ ? 0 : embd_bytes;
+        o.lazy_wait = req.lazy_wait;
         o.gpu_weight_bytes = dev_bytes_ + peer_bytes_;
         o.layer_end = split_at_;
         if (o.vision) {

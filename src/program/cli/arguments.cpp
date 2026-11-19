@@ -107,6 +107,13 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
+        else if (a == "--gpu-wait") {
+            o.gpu_wait = next("--gpu-wait");
+            if (o.gpu_wait != "auto" && o.gpu_wait != "spin" && o.gpu_wait != "yield" && o.gpu_wait != "block" && o.gpu_wait != "lazy") {
+                basalt::log::error("basalt", "--gpu-wait: auto, spin, yield, block or lazy");
+                return 2;
+            }
+        }
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
             o.relaxed_drafting = 0.5f;
