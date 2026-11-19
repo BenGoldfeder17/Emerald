@@ -55,6 +55,10 @@ struct CommonOptions {
     /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
     /// VRAM), for the models that take it
     int64_t kv_resident = 0;
+    /// --embedding-gpu: the dense models' token embedding (2.4 GiB for Qwen3.8-27B) on the main card instead of in
+    /// page-locked RAM. For a machine whose GPU memory is its own pool beside the OS's RAM (the RTX Spark N1X's
+    /// carve-out), where the page-locked copy takes RAM the system needs and the card has room to spare.
+    bool embedding_gpu = false;
     /// --diag-split-at N: diagnostic, a dense model split across two cards at layer N whether or not it fits one (0: off)
     int diag_split_at = 0;
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),

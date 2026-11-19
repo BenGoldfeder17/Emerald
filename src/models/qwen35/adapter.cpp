@@ -128,6 +128,7 @@ public:
         model_.reset();
         for (auto& [dev, b] : blocks_) cudaFree(b.base);
         if (embd_) cudaFreeHost(embd_);
+        if (embd_dev_) cudaFree(embd_dev_);
     }
 
     const model::ModelDesc& desc() const override { return desc_; }
@@ -200,24 +201,44 @@ private:
         if (split_at_ == 0 && !req.peer_devices.empty()) plan_stage(gg, g, req.peer_devices.front(), o.max_context, o.kv_resident);
         dense::Weights w;
         const int H = g.n_embd;
-        // the token embedding stays in page-locked host memory; the kernels read the rows they need
+        // the token embedding stays in page-locked host memory (or, with --embedding-gpu, on the main card); the kernels
+        // read the rows they need through a device pointer either way
         const TensorInfo* te = need(gg, "token_embd.weight", kTypeBf16, (int64_t) H * g.n_vocab, err);
         if (!te) return false;
-        if (cudaHostAlloc(&embd_, tensor_payload_bytes(*te), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
-            err = "out of page-locked memory for the token embedding";
-            return false;
-        }
-        {   // read into the page-locked host memory with the rest
+        const uint64_t embd_bytes = tensor_payload_bytes(*te);
+        if (req.embedding_gpu) {
+            if (cudaMalloc(&embd_dev_, embd_bytes) != cudaSuccess) {
+                cudaGetLastError();
+                err = "out of device memory for the token embedding (--embedding-gpu)";
+                return false;
+            }
+            int dev = 0;
+            cudaGetDevice(&dev);
             core::LoadItem it;
             it.file = plan_file_;
             it.off = gg.data_start() + te->offset;
-            it.bytes = tensor_payload_bytes(*te);
-            it.host = (uint8_t*) embd_;
-            plan_.add(it);   // (the token embedding is host memory: never the stage's)
+            it.bytes = embd_bytes;
+            it.dev = embd_dev_;
+            it.device = dev;
+            plan_.add(it);
+            w.embd = (const uint16_t*) embd_dev_;
+        } else {
+            if (cudaHostAlloc(&embd_, embd_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                err = "out of page-locked memory for the token embedding";
+                return false;
+            }
+            {   // read into the page-locked host memory with the rest
+                core::LoadItem it;
+                it.file = plan_file_;
+                it.off = gg.data_start() + te->offset;
+                it.bytes = embd_bytes;
+                it.host = (uint8_t*) embd_;
+                plan_.add(it);   // (the token embedding is host memory: never the stage's)
+            }
+            void* dev_embd = nullptr;
+            cudaHostGetDevicePointer(&dev_embd, embd_, 0);
+            w.embd = (const uint16_t*) dev_embd;
         }
-        void* dev_embd = nullptr;
-        cudaHostGetDevicePointer(&dev_embd, embd_, 0);
-        w.embd = (const uint16_t*) dev_embd;
         w.out_norm = floats(gg, "output_norm.weight", H, err);
         if (!w.out_norm || !linear(gg, "output", g.n_vocab, H, w.head, err)) return false;
         const int AQ = g.n_head * g.head_dim, KV = g.n_kv * g.head_dim;
@@ -274,13 +295,14 @@ private:
         }
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        basalt::log::info("basalt qwen35", "%zu tensors, %.2f GiB on the GPU, %.2f GiB of embedding in page-locked RAM; "
-                          "%.2f GiB free", n_tensors_, (double) dev_bytes_ / 1073741824.0, (double) tensor_payload_bytes(*te) / 1073741824.0,
-                          (double) free_b / 1073741824.0);
+        if (embd_dev_) dev_bytes_ += embd_bytes;   // on the card with the rest
+        basalt::log::info("basalt qwen35", "%zu tensors, %.2f GiB on the GPU, %.2f GiB of embedding %s; %.2f GiB free", n_tensors_,
+                          (double) dev_bytes_ / 1073741824.0, (double) embd_bytes / 1073741824.0,
+                          embd_dev_ ? "on the GPU (--embedding-gpu)" : "in page-locked RAM", (double) free_b / 1073741824.0);
         if (split_at_ > 0)
             basalt::log::info("basalt qwen35", "layer split: %.2f GiB of layers %d-%d on CUDA%d", (double) peer_bytes_ / 1073741824.0, split_at_,
                               g.n_layers - 1, req.peer_devices.front());
-        o.host_embedding_bytes = tensor_payload_bytes(*te);
+        o.host_embedding_bytes = embd_dev_ ? 0 : embd_bytes;
         o.gpu_weight_bytes = dev_bytes_ + peer_bytes_;
         o.layer_end = split_at_;
         if (o.vision) {
@@ -604,6 +626,7 @@ private:
     size_t n_tensors_ = 0;
     uint64_t dev_bytes_ = 0;
     void* embd_ = nullptr;
+    void* embd_dev_ = nullptr;           // --embedding-gpu: the token embedding on the main card instead
     core::LoadPlan plan_;                // the model's reads, for the start's one pass
     core::LoadPlan stage_plan_;          // the prompt split's, joined once its stage's memory is held
     core::LoadPlan* queue_to_ = &plan_;
@@ -650,6 +673,7 @@ public:
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
+        else if (a == "--embedding-gpu") o.embedding_gpu = true;
         else if (a == "--diag-split-at") o.diag_split_at = std::atoi(args.next("--diag-split-at"));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
