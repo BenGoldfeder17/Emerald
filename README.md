@@ -1,15 +1,17 @@
 <p align="center"><img src="assets/emerald.png" alt="Emerald" width="128"></p>
 
-# Emerald: Basalt for Windows on Arm (RTX Spark N1X)
+# Emerald: local AI for the RTX Spark N1X, built on Basalt
 
-Emerald is an unofficial port of [Basalt](https://github.com/jesdga95/basalt), the local inference engine for NVIDIA Blackwell
-GPUs by Jesús Gulfo, to Windows on Arm and Blackwell compute capability 12.1. With it Basalt runs on RTX Spark laptops with
-the N1X chip and serves Qwen3.8-27B entirely on the laptop's GPU. The program and its commands keep Basalt's name (`basalt.exe`).
+Emerald is a local AI inference platform for RTX Spark laptops with the N1X chip, running Windows on Arm. It is built on the
+architecture of [Basalt](https://github.com/jesdga95/basalt), Jesús Gulfo's inference engine for NVIDIA Blackwell GPUs, and
+serves Qwen3.8-27B entirely on the laptop's GPU through an OpenAI-compatible API.
 
-Upstream Basalt targets Linux and Windows x64 with compute capability 12.0 (the RTX 50 desktop cards). The engine, its kernels,
-the server and the model packs are Basalt's work; see [Credits](#credits). This repository adds the platform port, two new
-options, and two of Basalt's Flash-Next options extended to the dense model, all measured on the N1X. Port and N1X changes
-by [BenGoldfeder17](https://github.com/BenGoldfeder17).
+Basalt itself targets Linux and Windows x64 with compute capability 12.0 (the RTX 50 desktop cards). Emerald brings that
+architecture to Windows on Arm and compute capability 12.1, and adds a prebuilt download, two new options and two of
+Basalt's Flash-Next options extended to the dense model, all measured on the N1X. The engine, its kernels, the server and
+the model packs are Basalt's work; see [Credits](#credits). Emerald is an independent project by
+[BenGoldfeder17](https://github.com/BenGoldfeder17): it is not part of Basalt, and Basalt's author does not support it.
+The program and its commands keep Basalt's name (`basalt.exe`).
 
 Based on Basalt commit [`63cb68ad`](https://github.com/jesdga95/basalt/commit/63cb68ad471a443811ae171da0395bc3f1fc3ab5) of 2026-11-18. Basalt's own
 documentation is kept in [`docs/`](docs/) and applies here except where this page says otherwise.
@@ -34,10 +36,10 @@ context and thinking off, and each figure is the mean of two runs. More in [Meas
 | | |
 |---|---|
 | Works | Qwen3.8-27B (`Qwen3.8-27B-QUASAR-NVFP4.basalt`, with its DFlash 2 drafter): every weight on the GPU, context up to the model's 262,144 tokens, `basalt serve` with the OpenAI-compatible API, tool calls, the conversation cache. |
-| Not available | Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash. They keep their experts in system RAM and compute them with x86 (AVX2, AVX-512) kernels; on ARM64 those kernels are stubs that stop with a message. [Other N1X ports](#other-n1x-ports-of-basalt) run Flash-Next. |
+| Not available | Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash. They keep their experts in system RAM and compute them with x86 (AVX2, AVX-512) kernels; on ARM64 those kernels are stubs that stop with a message. [Other N1X projects](#other-n1x-projects-built-on-basalt) run Flash-Next. |
 | Not tested | Image and video input, more than one GPU, and Basalt's own test suite and quality gate (perplexity and KLD), none of which have been run on ARM64. |
 
-Everything here was built and measured on one laptop. Please report problems with this port in this repository, not upstream.
+Everything here was built and measured on one laptop. Please report problems with Emerald in this repository, not to Basalt.
 
 ## Quick start with the prebuilt download
 
@@ -121,17 +123,17 @@ cmake --build build -j 6
 
 The build takes about two minutes and the executables land in `bin\`. Then follow the quick start from step 3; the repository
 carries the same `basalt_config.json`, and with `%CUDA_PATH%\bin\arm64` on the path step 2 is not needed. Two build settings
-carry the port:
+make it an N1X build:
 
-- `-DBASALT_CUDA_ARCH=121` builds for compute capability 12.1 (the default, 120, is upstream's target). The start refuses a
+- `-DBASALT_CUDA_ARCH=121` builds for compute capability 12.1 (the default, 120, is Basalt's own target). The start refuses a
   GPU of the other capability.
 - ARM64 is detected from the host: the x86 CPU kernels are left out and stubs stand in for them. Only the dense model has
   been built and run, hence `-DBASALT_MODELS=qwen35`.
 
 ## Options for the N1X
 
-`--gpu-wait` and `--embedding-gpu` are new. `--prompt-cache-every` and `--relaxed-drafting` are Basalt options that upstream
-has for Flash-Next only; this port extends them to the dense model. Each is a command-line flag and, without the dashes, a
+`--gpu-wait` and `--embedding-gpu` are new. `--prompt-cache-every` and `--relaxed-drafting` are Basalt options that Basalt
+has for Flash-Next only; Emerald extends them to the dense model. Each is a command-line flag and, without the dashes, a
 key in the config's `engine` section. `gpu-wait`, `embedding-gpu` and `relaxed-drafting` are off unless set. The periodic
 checkpoints are on for the dense model; `--prompt-cache-every 0` turns them off.
 
@@ -145,10 +147,10 @@ checkpoints are on for the dense model; `--prompt-cache-every 0` turns them off.
 ## Measured on the N1X
 
 One RTX Spark N1X laptop with 64 GB of unified memory, 32,768-token context, `"kv": "int8"`, thinking off, two runs each.
-The first column is the port alone, which behaves like upstream Basalt. The second adds the periodic checkpoints and
+The first column is Emerald with none of its additions switched on, which behaves like Basalt itself. The second adds the periodic checkpoints and
 `relaxed-drafting 0.2` for the dense model. The third is LM Studio with the Q4_K_S GGUF of the same model.
 
-| | Port alone | With checkpoints and relaxed drafting | LM Studio |
+| | Basalt's behaviour | With checkpoints and relaxed drafting | LM Studio |
 |---|---|---|---|
 | Essay, temperature 0.6 | 34.2 tok/s | 39.1 tok/s | 24.1 tok/s |
 | Code, temperature 0 | 68.8 tok/s | 70.3 tok/s | 38.4 tok/s |
@@ -163,7 +165,7 @@ The first column is the port alone, which behaves like upstream Basalt. The seco
 - At the full 262,144-token context a 212,000-token prompt was read cold in 171 s and answered correctly; generation speed
   was the same as at 32,768.
 
-## Other N1X ports of Basalt
+## Other N1X projects built on Basalt
 
 Emerald is not the only one. Two others were offered to Basalt, which does not take platforms its author cannot test:
 
@@ -183,15 +185,15 @@ and measurements from a 64 GB laptop. It shares no code with either.
 - **Basalt** is the work of [Jesús Gulfo](https://github.com/jesdga95) and the
   [Basalt contributors](https://github.com/jesdga95/basalt/graphs/contributors): <https://github.com/jesdga95/basalt>,
   [basalt.jgulfo.com](https://basalt.jgulfo.com). The architecture, the CUDA kernels, the drafting, the server and the model
-  packs used here are all theirs. If this port is useful to you, consider [sponsoring Basalt](https://github.com/sponsors/jesdga95).
+  packs used here are all theirs. If Emerald is useful to you, consider [sponsoring Basalt](https://github.com/sponsors/jesdga95).
 - Basalt in turn builds on [Strata](https://github.com/Niko1221/Strata), [Infernix](https://github.com/Wallawalla47/Infernix),
   [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp) and ideas from [NInfer](https://github.com/Neroued/ninfer);
   their licences are in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
 - The model is [Qwen](https://huggingface.co/Qwen)'s Qwen3.8-27B in
   [QUASAR-QAT](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)'s NVFP4 form, with
   [z-lab](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)'s DFlash 2 drafter, under the licences on their cards.
-- The Windows on Arm port, the compute capability 12.1 build and the option work above are by
-  [BenGoldfeder17](https://github.com/BenGoldfeder17).
+- Emerald itself (bringing Basalt's architecture to Windows on Arm and compute capability 12.1, the options above and the
+  prebuilt download) is by [BenGoldfeder17](https://github.com/BenGoldfeder17).
 
 ## License
 
