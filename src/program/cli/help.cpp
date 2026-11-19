@@ -98,7 +98,7 @@ void usage() {
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8),\n"
                  "                       each slot with its own session (VRAM like the main one; with --kv-resident\n"
                  "                       and --kv int8 its K/V streams from RAM like the main one's)\n"
-                 "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
+                 "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384 Flash-Next, 8192 dense; 0 = off)\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default the pack's)\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"

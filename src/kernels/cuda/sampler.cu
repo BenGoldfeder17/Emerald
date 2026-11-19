@@ -359,6 +359,15 @@ __device__ int drawn_pick(const int* ids, Prob prob, int n, const SamplerParams&
     for (int i = 0; i < n; ++i)
         if (ids[i] == d) { pd = prob(i); break; }
     const double qd = q_of(d);
+    // relaxed drafting: a likely enough draft is kept outright, outside tool calls and never for an added token
+    if (p.relax > 0.0f && d < p.relax_special_from && pd >= (double) p.relax) {
+        bool call = p.relax_in_call;
+        for (int j = 0; j < t; ++j) {   // drafts[j] is the window's token j + 1, before this row's pick
+            if (p.drafts[j] == p.relax_call_open) call = true;
+            else if (p.drafts[j] == p.relax_call_close) call = false;
+        }
+        if (!call) return d;
+    }
     const float keep = philox_uniform(p.seed, p.counter + (uint64_t) t, kPhiloxKeep);
     if (qd > 0.0 && (pd >= qd || (double) keep * qd < pd)) return d;
     double mass = 0.0;

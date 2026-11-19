@@ -47,6 +47,13 @@ struct SamplerParams {
     const float* q_p = nullptr;
     int q_n = 0;
     int n_drawn = 0;
+    // Relaxed drafting (drawn drafts only): a draft the row gives probability relax or more is kept outright (0 = exact).
+    // Never for an added token (ids from relax_special_from on) or inside a tool call: relax_in_call is the state after
+    // the window's row 0, and the drafts before row t open or close calls for it.
+    float relax = 0.0f;
+    int relax_special_from = 0x7fffffff;
+    int relax_call_open = -1, relax_call_close = -1;
+    bool relax_in_call = false;
 };
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.

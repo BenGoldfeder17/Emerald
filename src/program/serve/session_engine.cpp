@@ -405,9 +405,25 @@ public:
     };
     Flow decode_begin() { return Flow::proceed; }
     void seed_tiers() {}
+    float default_relax() const override { return runtime_.o.relaxed_drafting; }
+    // the reply's tokens so far open or close a tool call (relaxed drafting stays exact inside one)
+    void note_calls(int a) {
+        for (int i = 0; i <= a; ++i)
+            if (outv[(size_t) i] == runtime_.o.relax_call_open) in_call_ = true;
+            else if (outv[(size_t) i] == runtime_.o.relax_call_close) in_call_ = false;
+    }
     void decode_state_begin() {
         draws_ = 0;
         n_draft_ = 0;
+        // relaxed drafting: sampled requests only, and never under logit_bias, a grammar or the quality gate
+        relax_on_ = req_relax > 0.0f && !req_sp.greedy && req_sp.temperature > 0.0f && !req_bias_present &&
+                    gguard == nullptr && ppl == nullptr;
+        in_call_ = false;
+        for (int64_t i = (int64_t) ids.size() - 1; relax_on_ && i >= 0; --i)
+            if (ids[(size_t) i] == runtime_.o.relax_call_open || ids[(size_t) i] == runtime_.o.relax_call_close) {
+                in_call_ = ids[(size_t) i] == runtime_.o.relax_call_open;
+                break;
+            }
         drafts_.assign((size_t) max_window(), 0);
         conf_.assign((size_t) max_window(), 0.0f);
         sbuf_.assign((size_t) max_window(), 0);
@@ -466,6 +482,11 @@ public:
         d.history = hist_n > 0 ? history_.data() : nullptr;
         d.history_len = hist_n;
         req_sp.counter = draws_;
+        req_sp.relax = relax_on_ ? req_relax : 0.0f;
+        req_sp.relax_special_from = (int) runtime_.o.relax_special_from;
+        req_sp.relax_call_open = (int) runtime_.o.relax_call_open;
+        req_sp.relax_call_close = (int) runtime_.o.relax_call_close;
+        req_sp.relax_in_call = in_call_;
         const basalt::model::Result r = rt_.session().decode_window(d);
         if (!r.ok()) error_ = r.message;
         return r.ok();
@@ -473,10 +494,13 @@ public:
     bool take_held(int) { return false; }
     bool window_failed() const { return false; }
     const char* window_error() const { return error_.c_str(); }
-    void relax_note_forced(int) {}
+    void relax_note_forced(int a) {
+        if (relax_on_) note_calls(a);
+    }
     int accept_drafts(int T) {
         int a = 0;
         while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+        if (relax_on_) note_calls(a);
         return a;
     }
     bool resample_row(int row, int64_t, const std::vector<float>& bias, int32_t& tok, std::string& e) {
@@ -623,6 +647,8 @@ private:
     std::vector<int32_t> history_;
     uint64_t draws_ = 0;
     bool own_drafts_ = false;   // the window's drafts are the drafter's (fill_drafts), not a lookup proposal
+    bool relax_on_ = false;     // relaxed drafting applies to this request (decode_state_begin)
+    bool in_call_ = false;      // the reply so far is inside a tool call
     std::vector<int32_t> drafts_, sbuf_;
     std::vector<float> conf_, window_conf_;
     int n_draft_ = 0;
@@ -950,7 +976,16 @@ Flow SessionRequest::read_to(int64_t to) {
             r = rt_.session().prefill_embeddings(b.rows.data(), b.n_rows, at, b.grid);
             at += b.n_rows;
         } else {
-            const int64_t end = next_block_ < blocks_.size() ? std::min(to, blocks_[next_block_].at) : to;
+            int64_t end = next_block_ < blocks_.size() ? std::min(to, blocks_[next_block_].at) : to;
+            // --prompt-cache-every: stop at each stride of fresh tokens (counted from where this request resumed) for a
+            // periodic checkpoint. The part's own end is checkpointed too, but it lies past the new message (a different
+            // question about the same document parts before it), so a stride is skipped only right at the end.
+            const int64_t every = runtime_.o.prompt_cache > 0 ? runtime_.o.prompt_cache_every : 0;
+            int64_t stride_at = -1;
+            if (every > 0) {
+                const int64_t next = read_from + ((at - read_from) / every + 1) * every;
+                if (next + 256 < end) stride_at = end = next;
+            }
             basalt::model::PrefillRequest pr;
             pr.tokens = ids32.data() + at;
             pr.n_tokens = (int) (end - at);
@@ -970,6 +1005,10 @@ Flow SessionRequest::read_to(int64_t to) {
             pr.stop = [this] { return runtime_.halted(); };
             r = rt_.session().prefill_chunk(pr);
             at = end;
+            if (r.ok() && stride_at == at && !runtime_.halted() && !rt_.checkpoint_at(at, ConvCheckpoint::kPeriodic, ids)) {
+                std::printf("ERR saving a conversation checkpoint failed: %s\n", runtime_.err.c_str());
+                return Flow::error;
+            }
         }
         if (!r.ok()) {
             basalt::log::error("basalt serve", "%s", r.message.c_str());

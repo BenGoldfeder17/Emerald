@@ -107,6 +107,19 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
+        else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+        else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
+            o.relaxed_drafting = 0.5f;
+            if (i + 1 < argc) {
+                char* e = nullptr;
+                const float v = std::strtof(argv[i + 1], &e);
+                if (e != argv[i + 1] && *e == '\0') {
+                    ++i;
+                    if (!(v > 0.0f && v <= 1.0f)) { basalt::log::error("basalt", "--relaxed-drafting: P must be in (0, 1]"); return 2; }
+                    o.relaxed_drafting = v;
+                }
+            }
+        }
         else if (a == "--turn-token") { o.turn_token = std::atoll(next("--turn-token")); o.turn_token_given = true; }
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--eos-ids") {

@@ -138,6 +138,18 @@ struct CommonOptions {
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
+    /// --serve: also checkpoint every N freshly read prompt tokens (0 = off), so a prompt that shares a long start with
+    /// an earlier one only up to the middle of a turn (the same document with another question, a chat whose later
+    /// history the client rewrote) reads from the last stride before they part instead of from the last turn end.
+    /// They are kPeriodic checkpoints in the same --prompt-cache chain (Flash-Next has its own, qwen4exp/options.hpp).
+    int64_t prompt_cache_every = 8192;
+    /// --serve, sampled requests with drawn drafts (the dense models' block drafter): also keep a draft the model gives
+    /// probability P or more (0 = exact speculative sampling; the flag alone = 0.5). Changes the output distribution
+    /// (that row is greedy); greedy requests, logit_bias, grammar/JSON, seeded requests, the added tokens (ids from
+    /// relax_special_from on) and everything inside a tool call stay exact. Flash-Next has its own (qwen4exp/options.hpp).
+    float relaxed_drafting = 0.0f;
+    int64_t relax_special_from = 248044;
+    int64_t relax_call_open = 248058, relax_call_close = 248059;
     /// --serve: the token that opens a chat turn (the pack's own, or --turn-token).  The last one in a prompt is where the chat's
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
     int64_t turn_token = -1;
