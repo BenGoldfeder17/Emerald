@@ -1,11 +1,18 @@
-// src/vision/gemm_cpu.cpp - see gemm_cpu.hpp.  AVX2 + FMA: a 4 x 4 register tile, bf16 widened by a shift.
+// src/vision/gemm_cpu.cpp - see gemm_cpu.hpp.  AVX2 + FMA (NEON on ARM64): a 4 x 4 register tile, bf16 widened by
+// a shift.
 #include "gemm_cpu.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <immintrin.h>
 #include <thread>
 #include <vector>
+
+#include "basalt/platform/compiler.hpp"
+#if !BASALT_HOST_ARM64
+#include <immintrin.h>
+#endif
 
 namespace basalt::vision {
 
@@ -19,6 +26,37 @@ inline float bf16_round(float f) {
     return f;
 }
 
+#if BASALT_HOST_ARM64
+// Y rows [m0,m0+rows) x columns [n0, n0+4): W rows as fp32 in wf (4 x K). Eight lanes per step as two NEON
+// registers, the AVX2 tile's width.
+void tile(const float* X, const float* wf, float* Y, int m0, int rows, int n0, int ncols, int N, int K) {
+    float32x4_t lo[4][4], hi[4][4];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) lo[i][j] = hi[i][j] = vdupq_n_f32(0.0f);
+    int k = 0;
+    for (; k + 8 <= K; k += 8) {
+        float32x4_t wl[4], wh[4];
+        for (int j = 0; j < 4; ++j) {
+            wl[j] = vld1q_f32(wf + (size_t) j * K + k);
+            wh[j] = vld1q_f32(wf + (size_t) j * K + k + 4);
+        }
+        for (int i = 0; i < rows; ++i) {
+            const float* xr = X + (size_t) (m0 + i) * K + k;
+            const float32x4_t xl = vld1q_f32(xr), xh = vld1q_f32(xr + 4);
+            for (int j = 0; j < 4; ++j) {
+                lo[i][j] = vfmaq_f32(lo[i][j], xl, wl[j]);
+                hi[i][j] = vfmaq_f32(hi[i][j], xh, wh[j]);
+            }
+        }
+    }
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < ncols; ++j) {
+            float s = vaddvq_f32(vaddq_f32(lo[i][j], hi[i][j]));
+            for (int kk = k; kk < K; ++kk) s += X[(size_t) (m0 + i) * K + kk] * wf[(size_t) j * K + kk];
+            Y[(size_t) (m0 + i) * N + n0 + j] = s;
+        }
+}
+#else
 inline float hsum(__m256 v) {
     __m128 a = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
     a = _mm_add_ps(a, _mm_movehl_ps(a, a));
@@ -46,6 +84,7 @@ void tile(const float* X, const float* wf, float* Y, int m0, int rows, int n0, i
             Y[(size_t) (m0 + i) * N + n0 + j] = s;
         }
 }
+#endif
 
 template <class LoadRow>
 void run(const float* X, float* Y, int M, int N, int K, int threads, LoadRow load) {
@@ -72,6 +111,15 @@ void run(const float* X, float* Y, int M, int N, int K, int threads, LoadRow loa
 }
 
 }  // namespace
+
+#if BASALT_HOST_ARM64
+// gemm_cpu_avx512.cpp is x86-only: no AVX-512 BF16 here, so gemm_bf16w takes the fp32 tile.
+bool cpu_has_bf16() { return false; }
+void gemm_bf16_avx512(const float*, const uint16_t*, float*, int, int, int, int) {
+    std::fprintf(stderr, "basalt-vision: the AVX-512 BF16 product is not built for ARM64\n");
+    std::abort();
+}
+#endif
 
 void gemm_bf16w(const float* X, const uint16_t* W, float* Y, int M, int N, int K, int threads, bool round_x) {
     static const bool has_bf16 = cpu_has_bf16();

@@ -1,7 +1,14 @@
 # basalt: a local inference engine for one NVIDIA GPU.
 cmake_minimum_required(VERSION 3.24)
+# The Blackwell compute capability the engine is built for: 120 (RTX 50 desktop cards) or 121 (GB10 and the RTX Spark
+# N1X). The kernels are the same; the arch-specific (`a`) targets and the start's capability check follow this value.
+set(BASALT_CUDA_ARCH 120 CACHE STRING "Blackwell compute capability to build for: 120 or 121")
+set_property(CACHE BASALT_CUDA_ARCH PROPERTY STRINGS 120 121)
+if(NOT BASALT_CUDA_ARCH MATCHES "^12[01]$")
+  message(FATAL_ERROR "BASALT_CUDA_ARCH is '${BASALT_CUDA_ARCH}': use 120 or 121")
+endif()
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
+  set(CMAKE_CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH} CACHE STRING "CUDA architectures" FORCE)
 endif()
 project(basalt VERSION 0.4.1 LANGUAGES C CXX CUDA)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
@@ -45,10 +52,12 @@ find_package(CUDAToolkit REQUIRED)
 # for sm_89 (Ada) so a non-Blackwell card can serve as the expert tier.
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
-  if(NOT _base STREQUAL "120")
-    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 only (peer-arch kernels are compiled separately below)")
+  if(NOT _base STREQUAL "${BASALT_CUDA_ARCH}")
+    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': this build is for compute capability ${BASALT_CUDA_ARCH} (BASALT_CUDA_ARCH; peer-arch kernels are compiled separately below)")
   endif()
 endforeach()
+# the start refuses a card of another compute capability (src/core/device.cu)
+add_compile_definitions(BASALT_CUDA_ARCH=${BASALT_CUDA_ARCH})
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
   message(FATAL_ERROR "CUDA ${CMAKE_CUDA_COMPILER_VERSION}: basalt needs CUDA 13.0 or newer")
 endif()
@@ -822,7 +831,7 @@ basalt_gpu_test(NAME window_gemm_two_gpu COMMAND window_gemm_two_gpu)
 set_tests_properties(window_gemm_two_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 # the FP8 and FP4 codes as bf16x2 (narrow_bf16.cuh): the direct cvt (CUDA 13.2+) and the f16 route, every input
 add_executable(narrow_bf16_parity tests/kernels/narrow_bf16_parity.cu)
-set_target_properties(narrow_bf16_parity PROPERTIES CUDA_ARCHITECTURES 120a-real)
+set_target_properties(narrow_bf16_parity PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH}a-real)
 target_include_directories(narrow_bf16_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(narrow_bf16_parity PRIVATE ${_gpu_runtime_target})
 basalt_gpu_test(NAME narrow_bf16_parity COMMAND narrow_bf16_parity)
@@ -1515,9 +1524,15 @@ if(BUILD_TESTING)
   basalt_cpu_test(NAME bf16_bits_test COMMAND bf16_bits_test)
 endif()
 
+if(BASALT_ARM64)
+# ARM64: the pool, the probes and the dispatch, with src/kernels/cpu/arm64_stubs.cpp in place of the x86 kernel files
+add_library(kernels_cpu STATIC src/kernels/cpu/pool.cpp src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp
+            src/kernels/cpu/native_expert.cpp src/kernels/cpu/arm64_stubs.cpp)
+else()
 add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp
             src/kernels/cpu/q2_avx2_vnni.cpp)
+endif()
 target_include_directories(kernels_cpu PUBLIC include)
 # only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1542,6 +1557,7 @@ set_target_properties(ggml_quants PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSIT
 # ggml_cpu_dispatch.cpp picks one at run time (cpu_avx512_ok / cpu_avx2_ok).
 set(_ggml_dots_avx2_flags ${_isa_avx2_flags})
 set(_ggml_dots_avx512_flags ${_isa_avx512_flags})
+if(NOT BASALT_ARM64)
 foreach(_isa avx2 avx512)
   add_library(ggml_dots_${_isa} OBJECT src/kernels/cpu/ggml/ggml_cpu_dots.c)
   target_include_directories(ggml_dots_${_isa} PRIVATE include src/kernels/cpu/ggml)
@@ -1558,6 +1574,7 @@ target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels
                                          src/kernels/cpu/kq_avx2.cpp
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
                                          $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
+endif()   # NOT BASALT_ARM64
 # the i-quant rows also use BMI2 (pdep/pext for the sign masks; cpu_avx512_ok requires it). MSVC compiles the
 # intrinsics without a switch.
 if(MSVC)
@@ -1582,7 +1599,7 @@ set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIO
 # and it must be compiled without __F16C__ for its definitions to survive; the callers carry prototypes and
 # #pragma function so the calls reach it. The file is empty for every other compiler, and it is not added to the
 # library at all there.
-if(MSVC)
+if(MSVC AND NOT BASALT_ARM64)
   target_sources(kernels_cpu PRIVATE src/kernels/cpu/ggml/f16c_scalar_msvc.c)
   set_source_files_properties(src/kernels/cpu/ggml/f16c_scalar_msvc.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 endif()
@@ -1626,7 +1643,7 @@ target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_moe_fused)
 endif()
 # a prompt chunk's products against FP8 E4M3 weights on the FP8 tensor cores (W8A8)
 add_library(prefill_fp8 STATIC src/prefill/fp8_gemm.cu)
-set_target_properties(prefill_fp8 PROPERTIES CUDA_ARCHITECTURES 120a-real)   # the block-scaled mma
+set_target_properties(prefill_fp8 PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH}a-real)   # the block-scaled mma
 target_include_directories(prefill_fp8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(prefill_fp8 PUBLIC core ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -1649,11 +1666,11 @@ endif()
 # a decode window's products against FP8 and NVFP4 matrices (the NVFP4 codes convert with sm_120a instructions)
 add_library(window_gemm STATIC src/kernels/cuda/window_gemm.cu src/kernels/cuda/window_gemm_f8.cu
                                src/kernels/cuda/window_gemm_nvfp4.cu)
-set_target_properties(window_gemm PROPERTIES CUDA_ARCHITECTURES 120a-real)
+set_target_properties(window_gemm PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH}a-real)
 target_include_directories(window_gemm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(window_gemm PUBLIC core ${_gpu_runtime_target})
 add_library(prefill_fp4 STATIC src/prefill/moe_fp4.cu src/prefill/fp4_dense.cu)
-set_target_properties(prefill_fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
+set_target_properties(prefill_fp4 PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH}a-real)
 target_include_directories(prefill_fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(prefill_fp4 PUBLIC mmq ${_gpu_runtime_target})
 if(BASALT_MODEL_QWEN4EXP)
@@ -1736,7 +1753,7 @@ if(BUILD_TESTING)
   set_tests_properties(fp4_dense_tma_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the SwiGLU epilogue's branch-free SiLU quotient against the plain expression on every float (built as the product is)
   add_executable(silu_parity tests/kernels/silu_parity.cu)
-  set_target_properties(silu_parity PROPERTIES CUDA_ARCHITECTURES 120a-real)
+  set_target_properties(silu_parity PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH}a-real)
   target_include_directories(silu_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(silu_parity PRIVATE ${_gpu_runtime_target})
   basalt_gpu_test(NAME silu_parity COMMAND silu_parity)

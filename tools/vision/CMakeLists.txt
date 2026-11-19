@@ -5,8 +5,9 @@
 #   cmake --build build-vision --target basalt-vision
 cmake_minimum_required(VERSION 3.24)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set(BASALT_CUDA_ARCH 120 CACHE STRING "Blackwell compute capability to build for: 120 or 121")
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 120)
+    set(CMAKE_CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH})
   endif()
   project(basalt_vision CXX CUDA)
   set(CMAKE_CXX_STANDARD 20)
@@ -31,10 +32,14 @@ add_library(vision_core STATIC
   ${VISION_ROOT}/src/vision/mrope_positions.cpp
   ${VISION_ROOT}/src/vision/mmproj.cpp
   ${VISION_ROOT}/src/vision/encoder_cpu.cpp
-  ${VISION_ROOT}/src/vision/gemm_cpu.cpp
-  ${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp)
+  ${VISION_ROOT}/src/vision/gemm_cpu.cpp)
 target_include_directories(vision_core PUBLIC ${VISION_ROOT}/include PRIVATE ${VISION_ROOT}/src/vision)
-if(MSVC)
+if(NOT BASALT_ARM64)
+  target_sources(vision_core PRIVATE ${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp)
+endif()
+if(BASALT_ARM64)
+  # NEON is the ARM64 baseline: gemm_cpu.cpp takes its NEON tile and has no AVX-512 BF16 path (cpu_has_bf16 is false)
+elseif(MSVC)
   # /arch: selects the baseline; the intrinsics used below are available to a function that uses them either way.
   set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
   # the AVX-512 BF16 file is only called after a run-time CPU check

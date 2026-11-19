@@ -4,6 +4,14 @@
 
 get_filename_component(BASALT_CMAKE_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 
+# ARM64 hosts (Windows on Arm, aarch64 Linux): the AVX2 / AVX-512 CPU kernels are left out and
+# src/kernels/cpu/arm64_stubs.cpp stands in for them (the probes in platform/compiler.hpp report no x86 feature).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^([Aa][Rr][Mm]64|aarch64|AArch64)$")
+  set(BASALT_ARM64 ON)
+else()
+  set(BASALT_ARM64 OFF)
+endif()
+
 # Warnings live on an INTERFACE target the project's own C++ code links, NOT in add_compile_options: applied
 # globally they would also hit the extracted ggml C and CUDA sources, whose warnings are not this project's to fix.
 # The flags are guarded by COMPILE_LANGUAGE:CXX so nvcc never receives them as inputs, and by the compiler id:
