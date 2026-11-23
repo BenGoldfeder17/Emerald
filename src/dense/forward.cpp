@@ -14,6 +14,7 @@
 
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/elementwise.hpp"
+#include "basalt/log.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1097,9 +1098,9 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
             int32_t* q = &p3[(r0[k] + i) * 3];
             q[0] = q[1] = q[2] = (int32_t) (pos[k] + i);
         }
-        const int64_t win = std::min<int64_t>(bd.window, pos[k] - sts[k]->dctx_from + 1);
+        const int64_t win = std::max<int64_t>(1, std::min<int64_t>(bd.window, pos[k] - sts[k]->dctx_from + 1));
         const int64_t lo = std::max<int64_t>(0, pos[k] - win + 1);
-        dwin[k] = {(int32_t) pos[k], (int32_t) (pos[k] + widths[k]), (int32_t) win, (int32_t) (lo / 32)};
+        dwin[k] = {(int32_t) pos[k], (int32_t) (pos[k] + widths[k]), (int32_t) win, (int32_t) (lo / kernels::kGqaChunk)};
     }
     const int32_t bounds[2] = {0, R};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
@@ -1145,7 +1146,7 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
             // the FFN, likewise (fused SwiGLU straight into BF16 b.hq when down runs on window_gemm)
             prod(m, D.conv_f, wnorm(m, b.x, D.ffn_norm, b.xn, D.conv_f.type, H, R, bd.eps, s), b.dyn, R, s);
             conv(b.xn, b.dyn, D.conv_f.rows, D.base_f);
-            if (on_wg(D.down.type)) {
+            if (on_wg(D.down.type) && D.gate.type == kTypeNvfp4Planes && D.up.type == kTypeNvfp4Planes) {
                 prod_swiglu(m, D.gate, D.up, b.bh, wact(m, b.bh, D.gate.type, H, R, s), nullptr, R, s, b.hq);
                 prod(m, D.down, b.hq, b.tmp, R, s);
             } else {
@@ -1202,9 +1203,14 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
     };
 
     bool launched = false;
+    bool skip_capture = false;
     for (Model::BatchGraph& bg : m.draft_graphs) {
         if (bg.key == key) {
             bg.used = ++m.draft_clock;
+            if (bg.failed) {
+                skip_capture = true;
+                break;
+            }
             if (cudaGraphLaunch(bg.exec, s) != cudaSuccess) return cuda_ok("block drafter graph", err) && false;
             launched = true;
             break;
@@ -1213,25 +1219,30 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
     if (!launched) {
         draft_body();
         if (!cuda_ok("block drafter", err)) return false;
-        cudaGraph_t graph = nullptr;
-        if (cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed) == cudaSuccess) {
-            draft_body();
+        if (!skip_capture) {
+            cudaGraph_t graph = nullptr;
             cudaGraphExec_t exec = nullptr;
-            if (cudaStreamEndCapture(s, &graph) == cudaSuccess && cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess) {
-                cudaGraphDestroy(graph);
-                if (m.draft_graphs.size() >= Model::kBatchGraphs) {
-                    auto old = std::min_element(m.draft_graphs.begin(), m.draft_graphs.end(),
-                                                [](const Model::BatchGraph& x, const Model::BatchGraph& y) { return x.used < y.used; });
-                    cudaGraphExecDestroy(old->exec);
-                    m.draft_graphs.erase(old);
-                }
-                m.draft_graphs.push_back({std::move(key), exec, ++m.draft_clock});
-            } else {
-                if (graph) cudaGraphDestroy(graph);
-                cudaGetLastError();
+            cudaError_t cap_err = cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed);
+            if (cap_err == cudaSuccess) {
+                draft_body();
+                cap_err = cudaStreamEndCapture(s, &graph);
+                if (cap_err == cudaSuccess) cap_err = cudaGraphInstantiate(&exec, graph, 0);
             }
-        } else {
-            cudaGetLastError();
+            if (graph) cudaGraphDestroy(graph);
+            if (m.draft_graphs.size() >= Model::kBatchGraphs) {
+                auto old = std::min_element(m.draft_graphs.begin(), m.draft_graphs.end(),
+                                            [](const Model::BatchGraph& x, const Model::BatchGraph& y) { return x.used < y.used; });
+                if (old->exec) cudaGraphExecDestroy(old->exec);
+                m.draft_graphs.erase(old);
+            }
+            if (cap_err == cudaSuccess && exec) {
+                m.draft_graphs.push_back({std::move(key), exec, ++m.draft_clock, false});
+            } else {
+                cudaGetLastError();
+                basalt::log::warn("basalt", "block drafter graph capture failed (%s); running eagerly",
+                                  cudaGetErrorString(cap_err));
+                m.draft_graphs.push_back({std::move(key), nullptr, ++m.draft_clock, true});
+            }
         }
     }
     for (int k = 0; k < S; ++k) {

@@ -905,6 +905,7 @@ bool SessionRuntime::next_batch_window() {
     }
     if (n_act >= 2 && total_t > 16) {
         constexpr double kBatchTailMinJoint = 0.20;
+        std::vector<bool> trimmed((size_t) n_act, false);
         while (total_t > 16) {
             int worst = -1;
             double worst_p = kBatchTailMinJoint;
@@ -921,9 +922,11 @@ bool SessionRuntime::next_batch_window() {
             }
             if (worst < 0) break;
             --want_t[(size_t) worst];
+            trimmed[(size_t) worst] = true;
             --total_t;
         }
-        for (int i = 0; i < n_act; ++i) limits[(size_t) i] = want_t[(size_t) i];
+        for (int i = 0; i < n_act; ++i)
+            if (trimmed[(size_t) i]) limits[(size_t) i] = want_t[(size_t) i];
     }
     std::vector<SlotWin> wins(act.size());
     std::vector<int> rows(act.size());
@@ -1039,9 +1042,9 @@ Flow SessionRequest::read_to(int64_t to) {
                 const int64_t next = read_from + ((at - read_from) / every + 1) * every;
                 if (next + 256 < end) stride_at = end = next;
             }
-            // While other batch slots are actively decoding, slice long prompt reads into 1024-token chunks so
-            // decoding slots receive windows continuously instead of freezing for the whole prompt read.
-            if (rt_.batch_on() && end - at > 1024) {
+            // While other batch slots are actively decoding on a dense model (slots_share_cells), slice long prompt
+            // reads into 1024-token chunks so decoding slots receive windows continuously instead of freezing.
+            if (rt_.slots_share_cells() && rt_.batch_on() && end - at > 1024) {
                 end = at + 1024;
                 if (stride_at != end) stride_at = -1;
             }
@@ -1076,12 +1079,27 @@ Flow SessionRequest::read_to(int64_t to) {
         }
         if (runtime_.halted()) { cancelled = true; return Flow::quit; }
         progress_line("PP", at);
-        if (rt_.batch_on() && at < to && !runtime_.halted()) {
+        if (rt_.slots_share_cells() && rt_.batch_on() && at < to && !runtime_.halted()) {
+            // Drain pending BSTOP lines so cancelled peer slots end on the next interleaved window instead of
+            // burning GPU time until this long prompt read finishes.
+            {
+                std::lock_guard<std::mutex> lk(runtime_.in_mu);
+                for (auto it = runtime_.in_lines.begin(); it != runtime_.in_lines.end();) {
+                    if (it->rfind("BSTOP ", 0) == 0) {
+                        const int b = std::atoi(it->c_str() + 6);
+                        if (b >= 0 && b < (int) runtime_.bs.size()) runtime_.bs[(size_t) b].stop = true;
+                        it = runtime_.in_lines.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
             const int saved = rt_.active();
-            for (int w = 0; w < 2 && rt_.batch_on(); ++w) {
+            for (int w = 0; w < 2 && rt_.batch_on() && !runtime_.halted(); ++w) {
                 if (!rt_.next_batch_window()) { rt_.set_active(saved); return Flow::error; }
             }
             rt_.set_active(saved);
+            if (runtime_.halted()) { cancelled = true; return Flow::quit; }
         }
     }
     if (part_checkpoint(to) &&

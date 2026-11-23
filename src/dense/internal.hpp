@@ -150,6 +150,7 @@ public:
         BatchKey key;
         cudaGraphExec_t exec = nullptr;
         uint64_t used = 0;
+        bool failed = false;
     };
     static constexpr size_t kBatchGraphs = 64;
     std::vector<BatchGraph> batch_graphs;
@@ -258,7 +259,7 @@ bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float*
 bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3,
                     std::string& err);
 /// One window of S sessions as one batch: segment k is segs[k].T rows (tokens and pos3 [row][3] packed in segment order, at
-/// most kWindow rows in all) at cells segs[k].pos.. of its session.  Each session is left as after its own forward_window
+/// most kBatch rows in all) at cells segs[k].pos.. of its session.  Each session is left as after its own forward_window
 /// (logits, the GDN rows for its commit, the drafter's rows); runs on the first session's stream.
 struct BatchSeg {
     SessionState* st = nullptr;

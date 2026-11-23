@@ -17,7 +17,7 @@ namespace basalt::kernels {
 namespace {
 
 constexpr int GMAX = 8;               // query heads per KV head
-constexpr int CHUNK = 32;             // cells per decode chunk
+constexpr int CHUNK = kGqaChunk;      // cells per decode chunk
 constexpr int kDecSplits = 64;        // a decode row's blocks per KV head (its chunks dealt round robin)
 constexpr int HD = 256;              // the prompt kernel's head width
 constexpr float kScaleLog2 = 0.0625f * 1.4426950408889634f;   // 1/sqrt(256) * log2(e)
@@ -59,7 +59,7 @@ __device__ __forceinline__ bool kv_far(const KvFar& f, int64_t& c) {
 // The windows one launch takes: segment k is rows [row0[k], row0[k + 1]) of q, the partials and the output, its 16-row
 // tiles of (row, head) pairs [tile0[k], tile0[k + 1]) of the grid, with its own cache and range.  Each block and each
 // merged row computes exactly what a launch of its segment alone would.
-constexpr int kMaxSegs = 16;
+constexpr int kMaxSegs = kGqaMaxWindow;
 struct DecSegs {
     int n = 1;
     int row0[kMaxSegs + 1] = {};

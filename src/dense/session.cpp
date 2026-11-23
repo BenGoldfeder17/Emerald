@@ -403,8 +403,12 @@ public:
             cudaEventRecord(ss[(size_t) i]->sync_ev_, ss[(size_t) i]->st_.stream);
             cudaStreamWaitEvent(s, ss[(size_t) i]->sync_ev_, 0);
         }
-        for (int i = 0; i < n; ++i)
+        for (int i = 0; i < n; ++i) {
             if (Result st = ss[(size_t) i]->settle(reqs[i].pos, true, s); !st.ok()) return st;   // commits on side streams, ctx on s
+            // MTP drafters run mtp_window on st_.stream using shared m_.ws; serialize before later sessions or forward_batch
+            if (ss[(size_t) i]->drafter_ && cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess)
+                return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        }
         for (int i = 0; i < n; ++i) ss[(size_t) i]->join_commit(s);
         for (int i = 0; i < n; ++i)
             if (ss[(size_t) i]->st_.peer && cudaStreamSynchronize(ss[(size_t) i]->st_.peer->stream) != cudaSuccess)
@@ -853,8 +857,9 @@ private:
             st_.dctx_from = 0;
             wide_ = false;
             st_.alt_ready = false;
+            const cudaStream_t ms = ctx_stream ? ctx_stream : st_.stream;
             if (m_.n_gdn &&
-                cudaMemsetAsync(st_.gdn, 0, (size_t) m_.n_gdn * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
+                cudaMemsetAsync(st_.gdn, 0, (size_t) m_.n_gdn * st_.gdn_floats * 4, ms) != cudaSuccess)
                 return fail("clearing the recurrent state failed");
             if (SessionState* p = st_.peer.get()) {
                 const core::OnDevice on(m_.split_dev);
@@ -870,10 +875,9 @@ private:
             return {};
         }
         const int64_t n = pos - pend_pos_;
-        pend_T_ = std::max(pend_T_, 0);
-        const int T = pend_T_;
-        pend_T_ = 0;
+        const int T = std::max(pend_T_, 0);
         if (n < 0 || n > T) return fail(m_.o.arch + ": position " + std::to_string((long long) pos) + " is not reachable from the last window");
+        pend_T_ = 0;
         wide_ = n >= std::max(2, m_.w.dflash.block - 2);
         const bool swap = st_.alt_ready && T == 1 && n == 1;
         st_.alt_ready = false;

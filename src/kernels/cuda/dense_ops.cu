@@ -94,6 +94,7 @@ __global__ void to_f32_kernel(const __nv_bfloat16* __restrict__ x, float* __rest
 __global__ void embed_rows_bf16_kernel(const uint16_t* __restrict__ embd, const int32_t* __restrict__ tok, int H8,
                                        uint16_t* __restrict__ out) {
     pdl_launch_dependents();
+    pdl_wait();
     const int t = (int) blockIdx.y;
     const int j = (int) blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= H8) return;
@@ -564,6 +565,10 @@ void to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
 }
 void embed_rows_bf16(const uint16_t* embd, const int32_t* tok, int T, int H, uint16_t* out, void* stream) {
     if (T <= 0 || H <= 0) return;
+    if (H % 8 != 0) {
+        basalt::log::error("basalt", "embed_rows_bf16: H %d not a multiple of 8", H);
+        std::exit(1);
+    }
     const int H8 = H / 8;
     launch_pdl(embed_rows_bf16_kernel, dim3(blocks_for(H8, 256), (unsigned) T), dim3(256), 0, (cudaStream_t) stream,
                embd, tok, H8, out);

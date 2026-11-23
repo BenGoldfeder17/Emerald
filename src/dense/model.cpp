@@ -377,8 +377,10 @@ SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter
 }
 
 Model::~Model() {
-    for (BatchGraph& g : batch_graphs) cudaGraphExecDestroy(g.exec);
-    for (BatchGraph& g : draft_graphs) cudaGraphExecDestroy(g.exec);
+    for (BatchGraph& g : batch_graphs)
+        if (g.exec) cudaGraphExecDestroy(g.exec);
+    for (BatchGraph& g : draft_graphs)
+        if (g.exec) cudaGraphExecDestroy(g.exec);
     if (gate_side) cudaStreamDestroy(gate_side);
     if (gate_fork) cudaEventDestroy(gate_fork);
     if (gate_join) cudaEventDestroy(gate_join);
