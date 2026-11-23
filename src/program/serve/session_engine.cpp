@@ -358,7 +358,10 @@ public:
         const size_t bytes = session().running_bytes();
         if (bytes == 0) return;
         const size_t keep = (size_t) (o.prompt_cache + 1) * (size_t) std::max(o.batch, 1);
-        if (!basalt::core::CheckpointBytes::allocator_type::reserve(bytes, keep, &basalt::core::kCheckpointPin))
+        // Pin only a hot working set up front (batch + 2 blocks) rather than every worst-case checkpoint slot, avoiding
+        // multi-GiB eager locked host RAM at startup on unified-memory machines; extra checkpoints allocate lazily on demand.
+        const size_t hot = std::min(keep, (size_t) std::max(o.batch, 1) + 2);
+        if (!basalt::core::CheckpointBytes::allocator_type::reserve(bytes, hot, &basalt::core::kCheckpointPin))
             basalt::log::warn("basalt serve", "checkpoint blocks not reserved: out of host memory");
         if (std::string e; !ckd.reserve(bytes, e)) basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", e.c_str());
         basalt::core::RunningState rs;   // a split model's second card keeps a spare of its own part
@@ -541,7 +544,10 @@ public:
     void stamp_before_commit() {}
     // each row's pick is the draw of its own index, whatever the width of the window
     bool commit(int keep, std::string&, int phase) {
-        if (phase == 2) draws_ += (uint64_t) keep;
+        if (phase == 2) {
+            last_keep_ = keep;
+            draws_ += (uint64_t) keep;
+        }
         return true;
     }
     void on_token(int32_t tok) {
@@ -552,10 +558,22 @@ public:
     template <class After>
     bool draft_next(int T, int a, int, int, bool, bool, bool will_draft, After& after_launch) {
         n_draft_ = 0;
-        if (!will_draft || max_window() < 2) return true;
+        if (!will_draft || max_window() < 2) {
+            if (basalt::model::Result r = rt_.session().flush_pending(p + last_keep_); !r.ok()) {
+                runtime_.err = r.message;
+                return false;
+            }
+            return true;
+        }
         const int n = drafts_ahead(T, max_window());
         if (basalt::model::Result r = rt_.session().draft_begin(outv[(size_t) a], p + a + 1, n); !r.ok()) {
-            if (r.status == basalt::model::Status::NotImplemented) return true;
+            if (r.status == basalt::model::Status::NotImplemented) {
+                if (basalt::model::Result f = rt_.session().flush_pending(p + last_keep_); !f.ok()) {
+                    runtime_.err = f.message;
+                    return false;
+                }
+                return true;
+            }
             runtime_.err = r.message;
             return false;
         }
@@ -670,6 +688,7 @@ private:
     std::vector<int32_t> drafts_, sbuf_;
     std::vector<float> conf_, window_conf_;
     int n_draft_ = 0;
+    int last_keep_ = 0;
     FILE* draft_log_ = nullptr;
     basalt::model::ModelSession::ExpertCounts counts0_;
     std::string error_;
@@ -747,6 +766,13 @@ bool SessionRuntime::slot_window_finish(int b, SlotWin& w) {
             return false;
         }
         w.drafting = r.ok();
+    }
+    if (!w.drafting) {
+        if (const basalt::model::Result r = session().flush_pending(bs[(size_t) b].p); !r.ok()) {
+            std::printf("ERR %s\n", r.message.c_str());
+            set_active(0);
+            return false;
+        }
     }
     return slot_window_end(b, w);
 }
@@ -966,13 +992,26 @@ bool SessionRuntime::next_batch_window() {
                 dn.push_back(wins[i].want);
             }
         }
+        // Flush finishing/non-drafting slots BEFORE launching draft_batch so their settle()/block_ctx_window() never
+        // runs concurrently with draft_batch on the model's shared decode scratch (m.ws / window_gemm workspace).
+        for (const size_t i : group) {
+            if (wins[i].want == 0) {
+                if (const basalt::model::Result r = sessions_[(size_t) act[i]]->flush_pending(bs[(size_t) act[i]].p); !r.ok())
+                    return failed(r.message);
+            }
+        }
         if (!ds.empty()) {
             const basalt::model::Result r = ds[0]->draft_batch(ds.data(), anchors.data(), dpos.data(), dn.data(), (int) ds.size());
             if (!r.ok() && r.status != basalt::model::Status::NotImplemented) return failed(r.message);
             for (const size_t i : group) wins[i].drafting = r.ok() && wins[i].want > 0;
         }
-        for (const size_t i : group)
+        for (const size_t i : group) {
+            if (!wins[i].drafting && wins[i].want > 0) {
+                if (const basalt::model::Result r = sessions_[(size_t) act[i]]->flush_pending(bs[(size_t) act[i]].p); !r.ok())
+                    return failed(r.message);
+            }
             if (!slot_window_end(act[i], wins[i])) return false;
+        }
     }
     set_active(0);
     return true;

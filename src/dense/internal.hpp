@@ -49,8 +49,7 @@ private:
 /// A batch window's device table: per window row its GDN segment, where its GDN rows go in its session, per segment its
 /// first cell.
 struct BatchTable {
-    kernels::SegRow first[kBatch];   // per segment its first row's entry, and where its GDN rows go
-    kernels::SegDst sdst[kBatch];
+    kernels::SegRow first[kBatch];   // per segment its first row's entry
     int32_t pos0[kBatch];
 };
 
@@ -78,14 +77,16 @@ struct WindowScratch {
     float *y = nullptr, *hl = nullptr;           // the GDN output rows; the drafter's head rows
     int32_t *iota = nullptr, *bounds = nullptr;  // the products' row map and the window's rows
     int32_t* pos0 = nullptr;                     // the window's first cell (device), read by its attention
-    // a batch window's: the packed GDN rows of the layer in hand (before they go to each session), its table
-    float* rq = nullptr;
+    // shared GDN commit rows across active sessions (rec_rows = kWindow solo, kBatch multi-slot; rec_h holds [k|v] only)
+    float *rec_qkv = nullptr, *rec_h = nullptr, *rec_gate = nullptr, *rec_beta = nullptr;
+    int rec_rows = 0;
     float* gab = nullptr;                        // its GDN gates (dec_gdn_gates): alpha [rows][h_v], then beta
     BatchTable* btab = nullptr;
     // the block drafter's: its rows' q, k, v, attention and convolution coefficients, the selector's projection
     float *bq = nullptr, *bk = nullptr, *bv = nullptr, *bqo = nullptr, *bao = nullptr, *dyn = nullptr, *bh = nullptr;
     float *battn = nullptr, *blp = nullptr, *bsel = nullptr;
     int32_t* bpos = nullptr;
+    int32_t* ctx_pos0 = nullptr;                 // device [kBatch]: per-segment start cell for graphed block_ctx_batch
     DraftWin* dwin = nullptr;
 };
 
@@ -100,7 +101,7 @@ struct ChunkScratch {
     float* attn_split = nullptr;                  // gqa_prompt_attn's key-split scratch (kAttnSplits splits)
     float *g = nullptr, *u = nullptr, *h = nullptr;
     float *hn = nullptr, *cat = nullptr;          // the drafter's history: main's normed rows, its input rows
-    float* dacc = nullptr;                        // the block drafter's projected features of the chunk's rows
+    float *dacc = nullptr, *dk = nullptr, *dv = nullptr;   // block drafter prompt features and K/V scratch
     void* a4 = nullptr;                           // the FP4 activations (fp4_dense), their token scales
     float* gs = nullptr;
     float* hmax = nullptr;                        // each row's largest |H| (the SwiGLU product's), for its FP4 rounding
@@ -157,6 +158,9 @@ public:
     uint64_t batch_clock = 0;
     std::vector<BatchGraph> draft_graphs;
     uint64_t draft_clock = 0;
+    std::vector<BatchGraph> ctx_graphs;
+    uint64_t ctx_clock = 0;
+    int rec_pending = 0;   // sessions with uncommitted GDN rows currently occupying ws.rec_*
     // a batch window's GDN gates run on gate_side beside the qkv/z product, from gate_fork to gate_join
     cudaStream_t gate_side = nullptr;
     cudaEvent_t gate_fork = nullptr, gate_join = nullptr;
@@ -175,6 +179,7 @@ public:
     int split_dev = -1;
     ~Model();
     bool ensure_chunk(std::string& err);
+    void release_chunk();
     /// llama.cpp's MMQ readied for every product of the model (its kernels loaded for each format and height).
     bool ready_products(std::string& err);
     /// The image encoder placed in device memory for pictures of up to `tokens` merged tokens.
@@ -207,10 +212,9 @@ struct SessionState {
     // (device-mapped); {} without.  kc/vc/kq then hold only the first kv_resident cells
     std::vector<kernels::KvFar> far_kv;
     void* far_host = nullptr;
-    // the last window's rows per GDN layer, until its commit
-    float *rec_qkv = nullptr, *rec_h = nullptr, *rec_gate = nullptr, *rec_beta = nullptr;
+    // row offset in m.ws.rec_* of this session's last decoded window (0 for solo, segment row0 for batch)
+    int rec_row0 = 0;
     int32_t* n_keep = nullptr;                   // device
-    float* logits = nullptr;                     // [kWindow][n_vocab]
     int32_t* picks = nullptr;                    // device [kWindow]
     int64_t rope_delta = 0;                      // rope position - cell index for the next text token
     cudaGraphExec_t wg[2][kWindow + 1] = {};     // the decode window of T rows, captured once per T and state buffer

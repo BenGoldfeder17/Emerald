@@ -288,19 +288,27 @@ __device__ __forceinline__ float ldf(const float* p) { return *p; }
 __device__ __forceinline__ float ldf(const __nv_bfloat16* p) { return __bfloat162float(*p); }
 __device__ __forceinline__ void stf(float* p, float v) { *p = v; }
 __device__ __forceinline__ void stf(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+struct QkPrepSegs {
+    int n = 0;
+    int row0[kGqaMaxWindow + 1] = {};
+    __half* kc[kGqaMaxWindow] = {};
+    __half* vc[kGqaMaxWindow] = {};
+    int64_t cell0[kGqaMaxWindow] = {};
+    int64_t cap[kGqaMaxWindow] = {};
+    const int32_t* cell0_dev[kGqaMaxWindow] = {};
+    KvInt8 q8[kGqaMaxWindow] = {};
+    KvFar far_kv[kGqaMaxWindow] = {};
+};
+
 template <int HDW, class In = float, class QO = float>
-// (launched through launch_pdl: the earlier kernels' outputs are read after pdl_wait, so they are not __restrict__)
-__global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, const In* k, const In* v,
-                                                            const float* __restrict__ q_norm,
-                                                            const float* __restrict__ k_norm, float eps, RopeSpec rope,
-                                                            const int32_t* pos, int n_head, int n_kv, QO* q_out,
-                                                            __half* k_cache, __half* v_cache, int64_t cell0, int q_stride,
-                                                            int64_t cap, const int32_t* cell0_dev, KvInt8 q8, KvFar far_kv) {
-    pdl_launch_dependents();
-    pdl_wait();
+__device__ __forceinline__ void attn_qk_prepare_body(const In* q_full, const In* k, const In* v,
+                                                     const float* __restrict__ q_norm, const float* __restrict__ k_norm,
+                                                     float eps, const RopeSpec& rope, const int32_t* pos, int n_head,
+                                                     int n_kv, QO* q_out, __half* k_cache, __half* v_cache, int64_t t,
+                                                     int64_t lt, int64_t cell0, int q_stride, int64_t cap,
+                                                     const int32_t* cell0_dev, KvInt8 q8, KvFar far_kv) {
     __shared__ float red[HDW / 32];
     __shared__ float xs[HDW], ks8[HDW], vs8[HDW];
-    const int64_t t = blockIdx.x;
     const int j = blockIdx.y, d = threadIdx.x;
     const bool is_q = j < n_head;
     const int head = is_q ? j : j - n_head;
@@ -327,7 +335,7 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         return;
     }
     const int64_t c0 = cell0_dev ? (int64_t) *cell0_dev : cell0;
-    int64_t cell = cap > 0 ? (c0 + t) % cap : c0 + t;
+    int64_t cell = cap > 0 ? (c0 + lt) % cap : c0 + lt;
     const bool fa = cell >= far_kv.at;   // a split cache's far cell: its row in the far buffers
     if (fa) cell -= far_kv.at;
     const int64_t at = (cell * n_kv + head) * HDW + d;
@@ -363,6 +371,37 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         q8.ks[(cell * n_kv + head) * (HDW / 64) + d / 64] = __half_as_ushort(hk);
         q8.vs[(cell * n_kv + head) * (HDW / 64) + d / 64] = __half_as_ushort(hv);
     }
+}
+
+template <int HDW, class In = float, class QO = float>
+// (launched through launch_pdl: the earlier kernels' outputs are read after pdl_wait, so they are not __restrict__)
+__global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, const In* k, const In* v,
+                                                            const float* __restrict__ q_norm,
+                                                            const float* __restrict__ k_norm, float eps, RopeSpec rope,
+                                                            const int32_t* pos, int n_head, int n_kv, QO* q_out,
+                                                            __half* k_cache, __half* v_cache, int64_t cell0, int q_stride,
+                                                            int64_t cap, const int32_t* cell0_dev, KvInt8 q8, KvFar far_kv) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int64_t t = blockIdx.x;
+    attn_qk_prepare_body<HDW, In, QO>(q_full, k, v, q_norm, k_norm, eps, rope, pos, n_head, n_kv, q_out, k_cache, v_cache,
+                                      t, t, cell0, q_stride, cap, cell0_dev, q8, far_kv);
+}
+
+template <int HDW>
+__global__ void __launch_bounds__(HDW) attn_qk_prepare_segs_kernel(const float* q_full, const float* k, const float* v,
+                                                                   const float* __restrict__ q_norm,
+                                                                   const float* __restrict__ k_norm, float eps, RopeSpec rope,
+                                                                   const int32_t* pos, int n_head, int n_kv, float* q_out,
+                                                                   int q_stride, const QkPrepSegs segs) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int64_t t = blockIdx.x;
+    int sk = 0;
+    while (sk + 1 < segs.n && t >= segs.row0[sk + 1]) ++sk;
+    attn_qk_prepare_body<HDW, float, float>(q_full, k, v, q_norm, k_norm, eps, rope, pos, n_head, n_kv, q_out, segs.kc[sk],
+                                            segs.vc[sk], t, t - segs.row0[sk], segs.cell0[sk], q_stride, segs.cap[sk],
+                                            segs.cell0_dev[sk], segs.q8[sk], segs.far_kv[sk]);
 }
 
 template <int Mode>
@@ -673,6 +712,48 @@ void attn_qk_prepare(const float* q_full, const float* k, const float* v, const 
         launch_pdl(attn_qk_prepare_kernel<128>, grid, dim3(128), 0, (cudaStream_t) stream, q_full, k, v, q_norm, k_norm, eps, r,
                    pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8, far_kv);
     check("attn_qk_prepare");
+}
+
+void attn_qk_prepare_segs(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
+                          float eps, const RopeSpec& rope, const int32_t* pos, const QkPrepSeg* segs, int n_seg,
+                          int n_head, int n_kv, float* q_out, void* stream, int hd, bool gated) {
+    if (n_seg <= 0) return;
+    if (n_seg == 1) {
+        attn_qk_prepare(q_full, k, v, q_norm, k_norm, eps, rope, pos, segs[0].T, n_head, n_kv, q_out, segs[0].k_cache,
+                        segs[0].v_cache, segs[0].cell0, stream, hd, gated, segs[0].cap, segs[0].cell0_dev, segs[0].q8,
+                        segs[0].far_kv);
+        return;
+    }
+    if (n_seg > kGqaMaxWindow || rope.rot <= 0 || rope.rot > hd || rope.rot % 2 || (hd != 128 && hd != 256)) {
+        basalt::log::error("basalt", "attn_qk_prepare_segs: invalid arguments (%d segs, rot %d, hd %d)", n_seg, rope.rot, hd);
+        std::exit(1);
+    }
+    QkPrepSegs ps;
+    ps.n = n_seg;
+    for (int i = 0; i < n_seg; ++i) {
+        if (segs[i].T < 1 || ps.row0[i] + segs[i].T > kGqaMaxWindow) {
+            basalt::log::error("basalt", "attn_qk_prepare_segs: invalid segment %d (T=%d)", i, segs[i].T);
+            std::exit(1);
+        }
+        ps.row0[i + 1] = ps.row0[i] + segs[i].T;
+        ps.kc[i] = (__half*) segs[i].k_cache;
+        ps.vc[i] = (__half*) segs[i].v_cache;
+        ps.cell0[i] = segs[i].cell0;
+        ps.cap[i] = segs[i].cap;
+        ps.cell0_dev[i] = segs[i].cell0_dev;
+        ps.q8[i] = segs[i].q8;
+        ps.far_kv[i] = segs[i].far_kv;
+    }
+    const dim3 grid((unsigned) ps.row0[n_seg], (unsigned) (n_head + n_kv));
+    const int qs = gated ? 2 * hd : hd;
+    const RopeSpec r = rope_tables(rope);
+    if (hd == 256)
+        launch_pdl(attn_qk_prepare_segs_kernel<256>, grid, dim3(256), 0, (cudaStream_t) stream, q_full, k, v, q_norm, k_norm,
+                   eps, r, pos, n_head, n_kv, q_out, qs, ps);
+    else
+        launch_pdl(attn_qk_prepare_segs_kernel<128>, grid, dim3(128), 0, (cudaStream_t) stream, q_full, k, v, q_norm, k_norm,
+                   eps, r, pos, n_head, n_kv, q_out, qs, ps);
+    check("attn_qk_prepare_segs");
 }
 
 void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint16_t* v, const float* q_norm, const float* k_norm,

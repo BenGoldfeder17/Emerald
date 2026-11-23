@@ -281,6 +281,9 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     }
 
     // ---- conv + SiLU of the head's q and k channels (L2-normalized) and of the block's v columns
+    const int h_row = a.h_kv_only ? (C - qk) : C;
+    const int ck_h = a.h_kv_only ? (qh * S + tid) : ck;
+    const int cv_h = a.h_kv_only ? (qk + gh * S + col) : cv;
     float yq[MAXT], yk[MAXT];
 #pragma unroll
     for (int t = 0; t < MAXT; ++t) {
@@ -296,7 +299,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         if (rg == 1) {
             const float yv = conv_silu<MAXT>(hv, wv, xv, t);
             sm.v[t][lane] = yv;
-            a.h[(size_t) t * C + cv] = yv;
+            a.h[(size_t) t * h_row + cv_h] = yv;
         }
     }
     rec_sync<SUB>();
@@ -311,8 +314,8 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         sm.qn[t][tid] = yq[t];
         sm.kn[t][tid] = yk[t];
         if (write_qk) {
-            a.h[(size_t) t * C + cq] = yq[t];
-            a.h[(size_t) t * C + ck] = yk[t];
+            if (!a.h_kv_only) a.h[(size_t) t * C + cq] = yq[t];
+            a.h[(size_t) t * h_row + ck_h] = yk[t];
         }
     }
     if (tid < T) {   // the gates, for the commit
@@ -429,7 +432,8 @@ __device__ __forceinline__ DecRecArgs seg_args(const DecRecArgs& a0, const SegRo
     a.state = r.gdn + state_off;
     a.qkv += r0 * a.C; a.x += r0 * a.n_embd; a.z += r0 * vd;
     if (!dst) {
-        a.h += r0 * a.C;
+        const size_t h_row = (size_t) (a.h_kv_only ? (a.C - S * a.h_k) : a.C);
+        a.h += r0 * h_row;
         a.gate += r0 * a.h_v; a.beta += r0 * a.h_v;
     } else {   // the segment's own rows in its sequence
         const SegDst d = dst[blockIdx.y];

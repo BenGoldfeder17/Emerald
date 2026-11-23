@@ -164,6 +164,67 @@ int main() {
         for (const auto& m : mixes) run(g, m, false, GdnGate::Sigmoid, false);
     for (const auto& m : mixes) run(big, m, true, GdnGate::Silu, true);
     run(small, {6, 3}, true, GdnGate::Sigmoid, true);
+    {   // h_kv_only + gdn_commit_layers: rec_seg_split + commit with h_kv_only=true must match h_kv_only=false bitwise
+        const Geo g = big;
+        const int SS = 128, C = 2 * g.h_k * SS + g.h_v * SS, HKV = C - g.h_k * SS, VD = g.h_v * SS, E = g.n_embd;
+        const std::vector<int> seg = {5, 3, 7, 4};
+        const int rows = 19, max_n = 7;
+        const size_t sf = (size_t) SS * g.h_v * SS + (size_t) C * 3;
+        auto qkv_h = randn((size_t) rows * C, 1.f), cw_h = randn((size_t) C * 4, 0.5f), x_h = randn((size_t) rows * E, 1.f);
+        auto wa_h = randbf((size_t) g.h_v * E, 0.02f), wb_h = randbf((size_t) g.h_v * E, 0.02f);
+        auto dt_h = randn(g.h_v, 0.5f), sa_h = randn(g.h_v, 0.5f), z_h = randn((size_t) rows * VD, 1.f), gam_h = randn(SS, 1.f);
+        std::vector<std::vector<float>> st0;
+        for (size_t k = 0; k < seg.size(); ++k) st0.push_back(randn(sf, 0.05f));
+        float *dqkv = up(qkv_h), *dcw = up(cw_h), *dx = up(x_h), *ddt = up(dt_h), *dsa = up(sa_h), *dz = up(z_h), *dgam = up(gam_h);
+        uint16_t *dwa = up(wa_h), *dwb = up(wb_h);
+        float *gates = (float*) zeros((size_t) 2 * rows * g.h_v * 4);
+        std::vector<float*> st_ref, st_kv;
+        std::vector<SegRow> f_ref, f_kv;
+        for (size_t k = 0, r0 = 0; k < seg.size(); r0 += seg[k++]) {
+            st_ref.push_back(up(st0[k]));
+            st_kv.push_back(up(st0[k]));
+            f_ref.push_back(SegRow{st_ref.back(), (int32_t) r0, 0, seg[k], seg[k], (int32_t) k, 0});
+            f_kv.push_back(SegRow{st_kv.back(), (int32_t) r0, 0, seg[k], seg[k], (int32_t) k, 0});
+        }
+        SegRow *dr_ref = up(f_ref), *dr_kv = up(f_kv);
+        float *h_ref = (float*) zeros((size_t) rows * C * 4), *h_kv = (float*) zeros((size_t) rows * HKV * 4);
+        float *g_ref = (float*) zeros((size_t) rows * g.h_v * 4), *b_ref = (float*) zeros((size_t) rows * g.h_v * 4);
+        float *g_kv = (float*) zeros((size_t) rows * g.h_v * 4), *b_kv = (float*) zeros((size_t) rows * g.h_v * 4);
+        float *o_ref = (float*) zeros((size_t) rows * VD * 4), *o_kv = (float*) zeros((size_t) rows * VD * 4);
+        uint16_t *y16_ref = (uint16_t*) zeros((size_t) rows * VD * 2), *y16_kv = (uint16_t*) zeros((size_t) rows * VD * 2);
+        DecRecArgs a;
+        a.qkv = dqkv; a.conv_w = dcw; a.x = dx; a.w_alpha = dwa; a.w_beta = dwb; a.dt = ddt; a.ssm_a = dsa;
+        a.z = dz; a.gamma = dgam; a.C = C; a.n_embd = E; a.h_k = g.h_k; a.h_v = g.h_v; a.eps = 1e-6f; a.gate_act = GdnGate::Silu;
+        dec_gdn_gates(a, rows, gates, S0);
+        DecRecArgs a0 = a, a1 = a;
+        a0.h = h_ref; a0.gate = g_ref; a0.beta = b_ref; a0.o = o_ref; a0.y16 = y16_ref; a0.h_kv_only = false;
+        a1.h = h_kv;  a1.gate = g_kv;  a1.beta = b_kv;  a1.o = o_kv;  a1.y16 = y16_kv;  a1.h_kv_only = true;
+        dec_gdn_rec_seg_split(a0, dr_ref, 0, (int) seg.size(), max_n, rows, S0, nullptr, 0, 0, gates);
+        dec_gdn_rec_seg_split(a1, dr_kv,  0, (int) seg.size(), max_n, rows, S0, nullptr, 0, 0, gates);
+        bool ok = same("h_kv_only y16", y16_ref, y16_kv, (size_t) rows * VD * 2);
+        int32_t* d_keep = nullptr;
+        cudaMalloc(&d_keep, 4);
+        for (size_t k = 0, r0 = 0; k < seg.size(); r0 += seg[k++]) {
+            const int nk = std::max(1, seg[k] - 1);
+            cudaMemcpyAsync(d_keep, &nk, 4, cudaMemcpyHostToDevice, S0);
+            GdnCommitLayers c0{st_ref[k], h_ref + r0 * C, dqkv + r0 * C, g_ref + r0 * g.h_v, b_ref + r0 * g.h_v,
+                               sf, (size_t) rows * C, (size_t) rows * g.h_v, (size_t) rows * C, C, g.h_k, g.h_v, 1, d_keep, false};
+            GdnCommitLayers c1{st_kv[k], h_kv + r0 * HKV, dqkv + r0 * C, g_kv + r0 * g.h_v, b_kv + r0 * g.h_v,
+                               sf, (size_t) rows * HKV, (size_t) rows * g.h_v, (size_t) rows * C, C, g.h_k, g.h_v, 1, d_keep, true};
+            gdn_commit_layers(c0, S0, 32, nk);
+            gdn_commit_layers(c1, S0, 32, nk);
+            ok = same("h_kv_only commit state", st_ref[k], st_kv[k], sf * 4) && ok;
+        }
+        std::printf("h_kv_only + shared commit (4 segs): %s\n", ok ? "bitwise" : "FAIL");
+        if (!ok) ++fails;
+        cudaFree(d_keep);
+        for (float* p : st_ref) cudaFree(p);
+        for (float* p : st_kv) cudaFree(p);
+        for (void* p : {(void*) dqkv, (void*) dcw, (void*) dx, (void*) ddt, (void*) dsa, (void*) dz, (void*) dgam, (void*) dwa,
+                        (void*) dwb, (void*) gates, (void*) dr_ref, (void*) dr_kv, (void*) h_ref, (void*) h_kv, (void*) g_ref,
+                        (void*) b_ref, (void*) g_kv, (void*) b_kv, (void*) o_ref, (void*) o_kv, (void*) y16_ref, (void*) y16_kv})
+            cudaFree(p);
+    }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

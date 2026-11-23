@@ -63,6 +63,20 @@ void attn_qk_prepare(const float* q_full, const float* k, const float* v, const 
                      float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv,
                      float* q_out, uint16_t* k_cache, uint16_t* v_cache, int64_t cell0, void* stream, int hd = 256,
                      bool gated = true, int64_t cap = 0, const int32_t* cell0_dev = nullptr, KvInt8 q8 = {}, KvFar far_kv = {});
+/// Batched attn_qk_prepare for S segments in one launch (packed rows in q_full/k/v/pos/q_out, per-segment cache and cell0).
+struct QkPrepSeg {
+    int T = 0;
+    uint16_t* k_cache = nullptr;
+    uint16_t* v_cache = nullptr;
+    int64_t cell0 = 0;
+    int64_t cap = 0;
+    const int32_t* cell0_dev = nullptr;
+    KvInt8 q8 = {};
+    KvFar far_kv = {};
+};
+void attn_qk_prepare_segs(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
+                          float eps, const RopeSpec& rope, const int32_t* pos, const QkPrepSeg* segs, int n_seg,
+                          int n_head, int n_kv, float* q_out, void* stream, int hd = 256, bool gated = true);
 /// The prompt chunk's form: BF16 q_full (gated, hd 256), k and v; BF16 q_out; the cache at cells cell0 + t.
 void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint16_t* v, const float* q_norm, const float* k_norm,
                           float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv, uint16_t* q_out,

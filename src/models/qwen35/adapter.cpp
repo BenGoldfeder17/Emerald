@@ -316,7 +316,7 @@ private:
         }
         const uint64_t need_b = dense::shared_bytes(g, o.max_context, o.kv_int8, o.kv_resident) +
                                 (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_int8,
-                                                                             o.kv_resident, 0, split_at_) +
+                                                                             o.kv_resident, 0, split_at_, o.spec < 2) +
                                 (req.peer_devices.empty() ? 0
                                  : split_at_ > 0           ? dense::stage_main_bytes(g, w.dflash)
                                                            : dense::prompt_split_main_bytes(g, w.dflash, o.max_context));

@@ -355,6 +355,81 @@ int main() {
         if (gqa16_diff) ++fails;
         cudaFree(dout16);
     }
+    {   // attn_qk_prepare_segs (HD=256 gated & HD=128 ungated, FP16 and INT8): bitwise vs per-segment attn_qk_prepare
+        for (const int hd : {256, 128}) {
+            const bool gated = hd == 256;
+            const int NH = hd == 256 ? 24 : 32, NKV = hd == 256 ? 4 : 8, qs = gated ? 2 * hd : hd;
+            const int lens[3] = {3, 5, 2}, R = 10;
+            const int64_t cap = hd == 128 ? 64 : 0;
+            const int64_t c0[3] = {10, 60, 25};
+            basalt::kernels::RopeSpec rope;
+            rope.rot = hd == 256 ? 64 : 128;
+            rope.theta = 1e6f;
+            auto qf = randn((size_t) R * NH * qs), kk = randn((size_t) R * NKV * hd), vv = randn((size_t) R * NKV * hd);
+            auto qn = randn(hd, 0.2f), kn = randn(hd, 0.2f);
+            for (auto& v : qn) v += 1.0f;
+            for (auto& v : kn) v += 1.0f;
+            std::vector<int32_t> pos((size_t) R * 3);
+            for (int t = 0; t < R; ++t) pos[t * 3] = pos[t * 3 + 1] = pos[t * 3 + 2] = 100 + t;
+            float *dqf = up(qf), *dk = up(kk), *dv = up(vv), *dqn = up(qn), *dkn = up(kn);
+            int32_t* dpos = up(pos);
+            float *qo_ref = nullptr, *qo_seg = nullptr;
+            cudaMalloc(&qo_ref, (size_t) R * NH * hd * 4);
+            cudaMalloc(&qo_seg, (size_t) R * NH * hd * 4);
+            const size_t cache_cells = 128;
+            const size_t ce = cache_cells * NKV * hd;
+            for (const bool i8 : {false, true}) {
+                uint16_t *kr[3] = {}, *vr[3] = {}, *ks[3] = {}, *vs[3] = {};
+                basalt::kernels::KvInt8 q8r[3] = {}, q8s[3] = {};
+                basalt::kernels::QkPrepSeg segs[3] = {};
+                int row = 0;
+                for (int i = 0; i < 3; ++i) {
+                    if (!i8) {
+                        cudaMalloc(&kr[i], ce * 2); cudaMalloc(&vr[i], ce * 2);
+                        cudaMalloc(&ks[i], ce * 2); cudaMalloc(&vs[i], ce * 2);
+                        cudaMemset(kr[i], 0, ce * 2); cudaMemset(vr[i], 0, ce * 2);
+                        cudaMemset(ks[i], 0, ce * 2); cudaMemset(vs[i], 0, ce * 2);
+                    } else {
+                        cudaMalloc(&q8r[i].k, ce); cudaMalloc(&q8r[i].v, ce);
+                        cudaMalloc(&q8r[i].ks, ce / 64 * 2); cudaMalloc(&q8r[i].vs, ce / 64 * 2);
+                        cudaMalloc(&q8s[i].k, ce); cudaMalloc(&q8s[i].v, ce);
+                        cudaMalloc(&q8s[i].ks, ce / 64 * 2); cudaMalloc(&q8s[i].vs, ce / 64 * 2);
+                        cudaMemset(q8r[i].k, 0, ce); cudaMemset(q8r[i].v, 0, ce);
+                        cudaMemset(q8r[i].ks, 0, ce / 64 * 2); cudaMemset(q8r[i].vs, 0, ce / 64 * 2);
+                        cudaMemset(q8s[i].k, 0, ce); cudaMemset(q8s[i].v, 0, ce);
+                        cudaMemset(q8s[i].ks, 0, ce / 64 * 2); cudaMemset(q8s[i].vs, 0, ce / 64 * 2);
+                    }
+                    basalt::kernels::attn_qk_prepare(dqf + (size_t) row * NH * qs, dk + (size_t) row * NKV * hd,
+                                                     dv + (size_t) row * NKV * hd, dqn, dkn, 1e-6f, rope,
+                                                     dpos + (size_t) row * 3, lens[i], NH, NKV,
+                                                     qo_ref + (size_t) row * NH * hd, kr[i], vr[i], c0[i], S, hd, gated, cap,
+                                                     nullptr, q8r[i]);
+                    segs[i] = {lens[i], ks[i], vs[i], c0[i], cap, nullptr, q8s[i], {}};
+                    row += lens[i];
+                }
+                basalt::kernels::attn_qk_prepare_segs(dqf, dk, dv, dqn, dkn, 1e-6f, rope, dpos, segs, 3, NH, NKV, qo_seg, S, hd, gated);
+                auto hqr = down(qo_ref, (size_t) R * NH * hd), hqs = down(qo_seg, (size_t) R * NH * hd);
+                int diff = std::memcmp(hqr.data(), hqs.data(), hqr.size() * 4) != 0;
+                for (int i = 0; i < 3; ++i) {
+                    if (!i8) {
+                        auto a = down(kr[i], ce), b = down(ks[i], ce), c = down(vr[i], ce), d = down(vs[i], ce);
+                        diff += (std::memcmp(a.data(), b.data(), ce * 2) != 0) + (std::memcmp(c.data(), d.data(), ce * 2) != 0);
+                        cudaFree(kr[i]); cudaFree(vr[i]); cudaFree(ks[i]); cudaFree(vs[i]);
+                    } else {
+                        auto a = down(q8r[i].k, ce), b = down(q8s[i].k, ce), c = down(q8r[i].v, ce), d = down(q8s[i].v, ce);
+                        auto as = down(q8r[i].ks, ce / 64), bs = down(q8s[i].ks, ce / 64), cs = down(q8r[i].vs, ce / 64), ds = down(q8s[i].vs, ce / 64);
+                        diff += (std::memcmp(a.data(), b.data(), ce) != 0) + (std::memcmp(c.data(), d.data(), ce) != 0) +
+                                (std::memcmp(as.data(), bs.data(), ce / 64 * 2) != 0) + (std::memcmp(cs.data(), ds.data(), ce / 64 * 2) != 0);
+                        cudaFree(q8r[i].k); cudaFree(q8r[i].v); cudaFree(q8r[i].ks); cudaFree(q8r[i].vs);
+                        cudaFree(q8s[i].k); cudaFree(q8s[i].v); cudaFree(q8s[i].ks); cudaFree(q8s[i].vs);
+                    }
+                }
+                std::printf("attn_qk_prepare_segs hd=%d %s bitwise diffs: %d%s\n", hd, i8 ? "int8" : "fp16", diff, diff ? "  FAIL" : "");
+                if (diff) ++fails;
+            }
+            cudaFree(dqf); cudaFree(dk); cudaFree(dv); cudaFree(dqn); cudaFree(dkn); cudaFree(dpos); cudaFree(qo_ref); cudaFree(qo_seg);
+        }
+    }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

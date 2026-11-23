@@ -55,6 +55,8 @@ struct DecRecArgs {
     unsigned long long* stamps = nullptr;   // bench: 10 per-phase timestamps per block
     bool early_trigger = true;   // let the next kernel launch once the constants are loaded
     GdnGate gate_act = GdnGate::Sigmoid;
+    // h_kv_only: h holds only [k | v] (stride C - S * h_k per row), skipping dead q writes (gdn_commit never reads q)
+    bool h_kv_only = false;
 };
 /// The block widths dec_gdn_rec is built for.
 bool dec_gdn_rec_supported(int n_embd);
@@ -115,9 +117,10 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
 struct GdnCommitLayers {
     float* state = nullptr;
     const float *h = nullptr, *qkv = nullptr, *gate = nullptr, *beta = nullptr;
-    size_t state_stride = 0, h_stride = 0, gb_stride = 0;
+    size_t state_stride = 0, h_stride = 0, gb_stride = 0, qkv_stride = 0;   // qkv_stride 0: same as h_stride
     int C = 0, h_k = 0, h_v = 0, n_layers = 0;
     const int32_t* n_keep = nullptr;
+    bool h_kv_only = false;   // h holds [k | v] only (stride C - S * h_k per row)
 };
 /// From `blocks` persistent blocks (grid-stride); each loads its next item while the current one runs.
 void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks = 32, int max_n = 8);

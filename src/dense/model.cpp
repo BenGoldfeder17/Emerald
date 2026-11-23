@@ -125,16 +125,94 @@ void wgemm_need(const Geometry& g, size_t& partial, size_t& tickets) {
         }
 }
 
-size_t window_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_context) {
+size_t window_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_context, int n_gdn = -1, int rec_rows = kBatch) {
     const size_t W = kBatch, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim;
+    const size_t ng = (size_t) (n_gdn >= 0 ? n_gdn : g.gdn_layers());
+    const size_t C = (size_t) g.conv_channels(), HKV = C - (size_t) g.gdn_k_heads * (size_t) g.gdn_state;
     size_t f = 4 * W * H + W * g.value_width() + W * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) + 3 * W * g.n_ff;
     if (g.attn_layers() > 0) f += kernels::gqa_decode_scratch_floats(max_context, kBatch, g.n_head);
-    f += W * (2 * (size_t) g.conv_channels() + 2 * (size_t) g.gdn_v_heads) + (sizeof(BatchTable) + 3) / 4;
+    f += 2 * W * (size_t) g.gdn_v_heads + (sizeof(BatchTable) + 3) / 4;
+    if (ng > 0) f += ng * (size_t) rec_rows * (C + HKV + 2 * (size_t) g.gdn_v_heads);
     f += W * 2 * H + kernels::row_logprobs_scratch_floats(kBatch, g.n_vocab) + W * g.value_width() + W * (size_t) g.n_vocab;
     f += block_scratch_floats(g, bd);
     size_t wp, wt;
     wgemm_need(g, wp, wt);
-    return f * 4 + 2 * act_slot(g) + q8_slot(g) + (wp + wt + 1) * 4 + W * 4 * 6 + 76 * 256;
+    return f * 4 + 2 * act_slot(g) + q8_slot(g) + (wp + wt + 1) * 4 + W * 4 * 8 + 96 * 256;
+}
+
+struct ChunkPlan {
+    bool gdn_bf16 = false, attn_bf16 = false, ffn_fp4 = false, any_fp4 = false;
+    bool kv_int8 = false, mtp = false, block = false;
+    size_t xq_bytes = 0, a4_bytes = 0, total_bytes = 0;
+};
+
+ChunkPlan plan_chunk(const Model& m) {
+    const Geometry& gg = m.g;
+    const size_t T = kChunk, H = (size_t) gg.n_embd, AQ = (size_t) gg.n_head * gg.head_dim, C = (size_t) gg.conv_channels();
+    const size_t VD = (size_t) gg.value_width(), HV = (size_t) gg.gdn_v_heads, KV = (size_t) gg.n_kv * gg.head_dim;
+    const size_t widest = std::max<size_t>({H, 2 * H, (size_t) gg.n_ff, VD, AQ});
+    ChunkPlan p;
+    p.kv_int8 = m.o.kv_int8;
+    p.mtp = m.o.drafter == Drafter::Mtp;
+    p.block = m.o.drafter == Drafter::Block;
+    p.gdn_bf16 = gg.gdn_layers() > 0;
+    p.attn_bf16 = gg.attn_layers() > 0;
+    p.ffn_fp4 = true;
+    size_t max_mmq_cols = 0, max_fp8_cols = 0;
+    auto note = [&](const Linear& l) {
+        if (!l.w) return;
+        if (l.type == kTypeF8) max_fp8_cols = std::max(max_fp8_cols, (size_t) l.cols);
+        else if (l.type == kTypeNvfp4Planes) p.any_fp4 = true;
+        else if (l.type != kTypeQ8P) max_mmq_cols = std::max(max_mmq_cols, (size_t) l.cols);
+    };
+    for (int il = m.lb; il < m.le; ++il) {
+        const Layer& L = m.w.layers[(size_t) il];
+        if (L.kind == Mixer::Gdn) {
+            const bool f8 = L.qkv.type == kTypeF8 && L.z.type == kTypeF8 && L.out.type == kTypeF8;
+            const bool fp4 = L.qkv.type == kTypeNvfp4Planes && L.z.type == kTypeNvfp4Planes && L.out.type == kTypeNvfp4Planes;
+            p.gdn_bf16 = p.gdn_bf16 && (f8 || fp4);
+            note(L.qkv); note(L.z); note(L.out);
+        } else {
+            const bool f8 = L.q.type == kTypeF8 && L.k.type == kTypeF8 && L.v.type == kTypeF8 && L.o.type == kTypeF8;
+            const bool fp4 = L.q.type == kTypeNvfp4Planes && L.k.type == kTypeNvfp4Planes && L.v.type == kTypeNvfp4Planes && L.o.type == kTypeNvfp4Planes;
+            p.attn_bf16 = p.attn_bf16 && (f8 || fp4);
+            note(L.q); note(L.k); note(L.v); note(L.o);
+        }
+        p.ffn_fp4 = p.ffn_fp4 && L.gate.type == kTypeNvfp4Planes && L.up.type == kTypeNvfp4Planes && L.down.type == kTypeNvfp4Planes;
+        note(L.gate); note(L.up); note(L.down);
+    }
+    if (p.mtp) {
+        p.attn_bf16 = false;
+        p.ffn_fp4 = false;
+        note(m.w.mtp.fc);
+        note(m.w.mtp.layer.q); note(m.w.mtp.layer.k); note(m.w.mtp.layer.v); note(m.w.mtp.layer.o);
+        note(m.w.mtp.layer.gate); note(m.w.mtp.layer.up); note(m.w.mtp.layer.down);
+    }
+    if (p.block) {
+        for (const Linear& l : m.w.dflash.fc) note(l);
+        for (const BlockDrafter::Layer& D : m.w.dflash.layers) { note(D.k); note(D.v); }
+    }
+    p.xq_bytes = std::max(max_mmq_cols ? prefill::mmq::q8_bytes(T, (int64_t) max_mmq_cols) : size_t(0),
+                          max_fp8_cols ? prefill::fp8::act_bytes(T, (int64_t) max_fp8_cols) : size_t(0));
+    p.a4_bytes = p.any_fp4 ? prefill::fp4_dense::act_bytes((int64_t) T, (int64_t) widest) : size_t(0);
+    // keep buffers: BF16 residual x, FP32 xn/tmp, optional MTP cat/hn or Block dacc, xq, a4, gs, hmax, tok/pos/iota/bounds
+    size_t keep = T * H * 2 + 2 * T * H * 4 + p.xq_bytes + p.a4_bytes + 2 * T * 4 + (5 * T + 2) * 4;
+    if (p.mtp) keep += (2 * T + 1) * H * 4;
+    if (p.block) keep += T * H * 4;
+    const size_t gdn = gg.gdn_layers()
+                           ? (p.gdn_bf16 ? (2 * T * C * 2 + 2 * T * VD * 2 + T * VD * 4 + 2 * T * HV * 4)
+                                         : (2 * T * C + 3 * T * VD + 4 * T * HV) * 4) +
+                                 kernels::gdn_work_bytes(T)
+                           : 0;
+    const size_t attn_buf = p.attn_bf16
+                                ? (T * (2 * AQ + 2 * KV + AQ) * 2 + T * (2 * AQ) * (p.kv_int8 ? 2 : 4))
+                                : T * (2 * AQ + 2 * KV + 3 * AQ) * 4;
+    const size_t attn_sp = p.kv_int8 ? kernels::gqa_prompt_split_floats((int64_t) T, gg.n_head, kAttnSplits) * 4 : 0;
+    const size_t attn = (gg.attn_layers() || p.mtp) ? attn_buf + attn_sp : 0;
+    const size_t ffn = p.ffn_fp4 ? T * (size_t) gg.n_ff * 2 : 3 * T * (size_t) gg.n_ff * 4;
+    const size_t blk = p.block ? 2 * T * (size_t) m.w.dflash.n_kv * (size_t) m.w.dflash.head_dim * 4 : 0;
+    p.total_bytes = keep + std::max({gdn, attn, ffn, blk}) + 40 * 256;
+    return p;
 }
 
 size_t chunk_bytes(const Geometry& g) {
@@ -264,9 +342,9 @@ bool decode_drafter(Model& m, std::string& err) {
             cudaMemGetInfo(&free_b, &total_b);
             const uint64_t sess_b =
                 (uint64_t) std::max(m.o.sessions, 1) *
-                (session_bytes(m.g, m.o.max_context, false, m.o.kv_int8, m.o.kv_resident, m.lb, m.le) +
+                (session_bytes(m.g, m.o.max_context, false, m.o.kv_int8, m.o.kv_resident, m.lb, m.le, m.o.spec < 2) +
                  block_session_bytes(m.g, m.w.dflash));
-            const uint64_t chunk_b = chunk_bytes(m.g);
+            const uint64_t chunk_b = plan_chunk(m).total_bytes;
             const uint64_t reserve_b = (uint64_t) std::max(m.o.vram_reserve_mib, 0) << 20;
             if (free_b > sess_b + chunk_b + reserve_b + hb + (512ull << 20)) {
                 void* p = nullptr;
@@ -380,21 +458,24 @@ uint64_t session_host_bytes(const Geometry& g, int64_t max_context, bool kv_int8
     return (uint64_t) (max_context - resident_cells(max_context, kv_resident)) * g.attn_layers() * cell_bytes(g, kv_int8);
 }
 
-uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, bool kv_int8, int64_t kv_resident) {
+uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, bool kv_int8, int64_t kv_resident,
+                             bool gdn_alt) {
     if (g.kinds[(size_t) il] == Mixer::Gdn) {
         const uint64_t C = (uint64_t) g.conv_channels();
-        return (2 * ((uint64_t) g.gdn_state * g.gdn_v_heads * g.gdn_state + C * 3) + kWindow * (2 * C + 2 * (uint64_t) g.gdn_v_heads)) * 4;
+        return (gdn_alt ? 2ull : 1ull) * ((uint64_t) g.gdn_state * g.gdn_v_heads * g.gdn_state + C * 3) * 4;
     }
     return (uint64_t) resident_cells(max_context, kv_resident) * cell_bytes(g, kv_int8) + 4 * 256;
 }
 
-uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8, int64_t kv_resident, int lb, int le) {
+uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8, int64_t kv_resident, int lb, int le,
+                       bool gdn_alt) {
     uint64_t b = 64 * 256;
-    for (int il = lb; il < (le > 0 ? le : g.n_layers); ++il) b += session_layer_bytes(g, il, max_context, kv_int8, kv_resident);
+    for (int il = lb; il < (le > 0 ? le : g.n_layers); ++il)
+        b += session_layer_bytes(g, il, max_context, kv_int8, kv_resident, gdn_alt);
     if (lb > 0) return b;
     const uint64_t drafter = mtp ? (uint64_t) max_context * cell_bytes(g, false) + ((uint64_t) (kWindow + 3) * g.n_embd + g.n_vocab + (uint64_t) kWindow * 64) * 4
                                  : 0;
-    return b + drafter + (uint64_t) kWindow * g.n_vocab * 4;
+    return b + drafter + (uint64_t) kWindow * 4;
 }
 
 uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd) {
@@ -410,11 +491,12 @@ SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter
     in.layer = layer_weights;
     in.slots = std::max(o.sessions, 1);
     uint64_t layers = 0;
+    const bool gdn_alt = o.spec < 2;
     for (int il = 0; il < g.n_layers; ++il) {
-        in.per_slot.push_back(session_layer_bytes(g, il, o.max_context, o.kv_int8, o.kv_resident));
+        in.per_slot.push_back(session_layer_bytes(g, il, o.max_context, o.kv_int8, o.kv_resident, gdn_alt));
         layers += in.per_slot.back();
     }
-    const uint64_t slot_rest = session_bytes(g, o.max_context, mtp, o.kv_int8, o.kv_resident) - layers +
+    const uint64_t slot_rest = session_bytes(g, o.max_context, mtp, o.kv_int8, o.kv_resident, 0, 0, gdn_alt) - layers +
                                (o.drafter == Drafter::Block ? block_session_bytes(g, bd) : 0);
     const uint64_t scratch = shared_bytes(g, o.max_context, o.kv_int8, o.kv_resident);
     in.main_fixed = main_weights + scratch + (uint64_t) in.slots * slot_rest + stage_main_bytes(g, bd);
@@ -428,6 +510,8 @@ Model::~Model() {
     for (BatchGraph& g : batch_graphs)
         if (g.exec) cudaGraphExecDestroy(g.exec);
     for (BatchGraph& g : draft_graphs)
+        if (g.exec) cudaGraphExecDestroy(g.exec);
+    for (BatchGraph& g : ctx_graphs)
         if (g.exec) cudaGraphExecDestroy(g.exec);
     if (gate_side) cudaStreamDestroy(gate_side);
     if (gate_fork) cudaEventDestroy(gate_fork);
@@ -498,58 +582,97 @@ bool Model::ready_products(std::string& err) {
 bool Model::ensure_chunk(std::string& err) {
     if (chunk_ready) return true;
     const Geometry& gg = g;
-    if (!pre_arena.reserve(chunk_bytes(gg))) {
+    const ChunkPlan cp = plan_chunk(*this);
+    if (!pre_arena.reserve(cp.total_bytes)) {
         err = o.arch + ": out of device memory for the prompt workspaces";
         return false;
     }
     const size_t T = kChunk, H = (size_t) gg.n_embd, AQ = (size_t) gg.n_head * gg.head_dim, C = (size_t) gg.conv_channels();
     const size_t VD = (size_t) gg.value_width(), HV = (size_t) gg.gdn_v_heads, KV = (size_t) gg.n_kv * gg.head_dim;
-    const size_t widest = std::max<size_t>({H, (size_t) gg.n_ff, VD, AQ});
     ChunkScratch& b = cs;
-    b.x = pre_arena.take<float>(T * H);
+    b = {};
+    b.x = reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * H));   // BF16 residual stream (residual(b))
     b.xn = pre_arena.take<float>(T * H);
     b.tmp = pre_arena.take<float>(T * H);
-    b.xq = pre_arena.take_bytes(std::max(prefill::mmq::q8_bytes(T, (int64_t) widest), prefill::fp8::act_bytes(T, (int64_t) widest)));
+    b.xq = cp.xq_bytes ? pre_arena.take_bytes(cp.xq_bytes) : nullptr;
     b.tok = pre_arena.take<int32_t>(T);
     b.pos = pre_arena.take<int32_t>(3 * T);
     b.iota = pre_arena.take<int32_t>(T);
     b.bounds = pre_arena.take<int32_t>(2);
-    if (o.drafter == Drafter::Mtp) {
+    if (cp.mtp) {
         b.cat = pre_arena.take<float>(T * H);
         b.hn = pre_arena.take<float>((T + 1) * H);
     }
-    if (o.drafter == Drafter::Block) b.dacc = pre_arena.take<float>(T * H);
+    if (cp.block) b.dacc = pre_arena.take<float>(T * H);
     // the FP4 activations (fp4_dense) of the widest product input and their token scales
-    b.a4 = pre_arena.take_bytes(prefill::fp4_dense::act_bytes((int64_t) T, (int64_t) widest));
+    b.a4 = cp.a4_bytes ? pre_arena.take_bytes(cp.a4_bytes) : nullptr;
     b.gs = pre_arena.take<float>(T);
     b.hmax = pre_arena.take<float>(T);
     const size_t phase = pre_arena.mark();
     if (gg.gdn_layers()) {
-        b.qkv = pre_arena.take<float>(T * C);
-        b.hc = pre_arena.take<float>(T * C);
-        b.z = pre_arena.take<float>(T * VD);
-        b.y = pre_arena.take<float>(T * VD);
-        b.yn = pre_arena.take<float>(T * VD);
-        b.gate = pre_arena.take<float>(T * HV);
-        b.beta = pre_arena.take<float>(T * HV);
-        b.ab = pre_arena.take<float>(T * 2 * HV);
+        if (cp.gdn_bf16) {
+            b.qkv = reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * C));
+            b.hc = reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * C));
+            b.z = reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * VD));
+            b.y = pre_arena.take<float>(T * VD);
+            b.yn = reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * VD));
+            b.gate = pre_arena.take<float>(T * HV);
+            b.beta = pre_arena.take<float>(T * HV);
+        } else {
+            b.qkv = pre_arena.take<float>(T * C);
+            b.hc = pre_arena.take<float>(T * C);
+            b.z = pre_arena.take<float>(T * VD);
+            b.y = pre_arena.take<float>(T * VD);
+            b.yn = pre_arena.take<float>(T * VD);
+            b.gate = pre_arena.take<float>(T * HV);
+            b.beta = pre_arena.take<float>(T * HV);
+            b.ab = pre_arena.take<float>(T * 2 * HV);
+        }
         b.work = pre_arena.take_bytes(kernels::gdn_work_bytes(T));
+        if (!b.work) {
+            err = o.arch + ": the prompt GDN workspaces do not fit their arena";
+            return false;
+        }
         pre_arena.rewind(phase);
     }
-    if (gg.attn_layers()) {
-        b.qfull = pre_arena.take<float>(T * 2 * AQ);
-        b.k = pre_arena.take<float>(T * KV);
-        b.v = pre_arena.take<float>(T * KV);
-        b.qo = pre_arena.take<float>(T * AQ);
-        b.ao = pre_arena.take<float>(T * AQ);
-        b.ag = pre_arena.take<float>(T * AQ);
-        b.attn_split = pre_arena.take<float>(kernels::gqa_prompt_split_floats((int64_t) T, gg.n_head, kAttnSplits));
+    if (gg.attn_layers() || cp.mtp) {
+        if (cp.attn_bf16) {
+            b.qfull = reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * 2 * AQ));
+            b.k = reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * KV));
+            b.v = reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * KV));
+            b.qo = reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * AQ));
+            b.ao = cp.kv_int8 ? reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * AQ)) : pre_arena.take<float>(T * AQ);
+            b.ag = cp.kv_int8 ? reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * AQ)) : pre_arena.take<float>(T * AQ);
+        } else {
+            b.qfull = pre_arena.take<float>(T * 2 * AQ);
+            b.k = pre_arena.take<float>(T * KV);
+            b.v = pre_arena.take<float>(T * KV);
+            b.qo = pre_arena.take<float>(T * AQ);
+            b.ao = pre_arena.take<float>(T * AQ);
+            b.ag = pre_arena.take<float>(T * AQ);
+        }
+        if (cp.kv_int8)
+            b.attn_split = pre_arena.take<float>(kernels::gqa_prompt_split_floats((int64_t) T, gg.n_head, kAttnSplits));
+        if (!b.ag || (cp.kv_int8 && !b.attn_split)) {
+            err = o.arch + ": the prompt attention workspaces do not fit their arena";
+            return false;
+        }
         pre_arena.rewind(phase);
     }
-    b.g = pre_arena.take<float>(T * gg.n_ff);
-    b.u = pre_arena.take<float>(T * gg.n_ff);
-    b.h = pre_arena.take<float>(T * gg.n_ff);
-    if (!b.h || !b.x) {
+    if (cp.ffn_fp4) {
+        b.h = reinterpret_cast<float*>(pre_arena.take<uint16_t>(T * (size_t) gg.n_ff));
+    } else {
+        b.g = pre_arena.take<float>(T * (size_t) gg.n_ff);
+        b.u = pre_arena.take<float>(T * (size_t) gg.n_ff);
+        b.h = pre_arena.take<float>(T * (size_t) gg.n_ff);
+    }
+    if (cp.block) {
+        pre_arena.rewind(phase);
+        const size_t BKV = (size_t) w.dflash.n_kv * (size_t) w.dflash.head_dim;
+        b.dk = pre_arena.take<float>(T * BKV);
+        b.dv = pre_arena.take<float>(T * BKV);
+    }
+    if (!b.h || !b.x || (cp.xq_bytes && !b.xq) || (cp.a4_bytes && !b.a4) || (cp.block && (!b.dacc || !b.dk || !b.dv))) {
         err = o.arch + ": the prompt workspaces do not fit their arena";
         return false;
     }
@@ -560,6 +683,13 @@ bool Model::ensure_chunk(std::string& err) {
     }
     chunk_ready = true;
     return true;
+}
+
+void Model::release_chunk() {
+    if (!chunk_ready) return;
+    pre_arena.reserve(0);
+    cs = {};
+    chunk_ready = false;
 }
 
 ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::string& err) {
@@ -602,7 +732,8 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         basalt::log::info("basalt dense", "image encoder: %.2f GiB staged in page-locked RAM, on the card per request",
                           (double) m->encoder->weights_bytes() / 1073741824.0);
     }
-    if (!m->dec_arena.reserve(window_bytes(g, o.drafter == Drafter::Block ? w.dflash : BlockDrafter{}, o.max_context))) {
+    const int rec_rows = o.sessions > 1 ? kBatch : kWindow;
+    if (!m->dec_arena.reserve(window_bytes(g, o.drafter == Drafter::Block ? w.dflash : BlockDrafter{}, o.max_context, m->n_gdn, rec_rows))) {
         err = o.arch + ": out of device memory for the decode scratch";
         return nullptr;
     }
@@ -647,6 +778,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         b.blp = a.take<float>(W * kernels::kLogprobStride);
         b.bsel = a.take<float>(W * bd.rank);
         b.bpos = a.take<int32_t>(W * 3);
+        b.ctx_pos0 = a.take<int32_t>(W);
         b.dwin = a.take<DraftWin>(W);
         b.battn = a.take<float>(kernels::gqa_decode_scratch_floats(bd.window + 256, kBatch, bd.n_head, bd.head_dim));
     }
@@ -655,9 +787,16 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     b.iota = a.take<int32_t>(W);
     b.bounds = a.take<int32_t>(2);
     b.pos0 = a.take<int32_t>(2);
-    if (g.gdn_layers() > 0) {
-        b.rq = a.take<float>(W * (size_t) g.conv_channels());
-        b.gab = a.take<float>(2 * W * (size_t) g.gdn_v_heads);
+    if (m->n_gdn > 0) {
+        const size_t ng = (size_t) m->n_gdn, rr = (size_t) rec_rows;
+        const size_t C = (size_t) g.conv_channels(), HKV = C - (size_t) g.gdn_k_heads * (size_t) g.gdn_state;
+        const size_t HV = (size_t) g.gdn_v_heads;
+        b.rec_rows = rec_rows;
+        b.rec_qkv = a.take<float>(ng * rr * C);
+        b.rec_h = a.take<float>(ng * rr * HKV);
+        b.rec_gate = a.take<float>(ng * rr * HV);
+        b.rec_beta = a.take<float>(ng * rr * HV);
+        b.gab = a.take<float>(2 * W * HV);
         if (cudaStreamCreateWithFlags(&m->gate_side, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&m->gate_fork, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&m->gate_join, cudaEventDisableTiming) != cudaSuccess) {
@@ -666,7 +805,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         }
     }
     b.btab = a.take<BatchTable>(1);
-    if (!b.bounds) {
+    if (!b.btab) {
         err = o.arch + ": the decode scratch does not fit its arena";
         return nullptr;
     }

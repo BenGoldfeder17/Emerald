@@ -45,7 +45,8 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         blockbytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
                       (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
     }
-    const uint64_t dev_bytes = session_bytes(g, m.o.max_context, mtp, m.o.kv_int8, m.o.kv_resident, m.lb, m.le);
+    const bool gdn_alt = m.o.spec < 2;
+    const uint64_t dev_bytes = session_bytes(g, m.o.max_context, mtp, m.o.kv_int8, m.o.kv_resident, m.lb, m.le, gdn_alt);
     if (!st.arena.reserve(dev_bytes + blockbytes)) {
         err = m.o.arch + ": out of device memory for a session of " + std::to_string((long long) m.o.max_context) +
               " cells (" + std::to_string((unsigned long long) (dev_bytes >> 20)) + " MiB); lower --max-context or --parallel";
@@ -56,11 +57,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
     const size_t ng = (size_t) m.n_gdn;
     if (ng) {
         st.gdn = st.gdn_first = st.arena.take<float>(ng * st.gdn_floats);
-        st.gdn_alt = st.arena.take<float>(ng * st.gdn_floats);
-        st.rec_qkv = st.arena.take<float>(ng * kWindow * C);
-        st.rec_h = st.arena.take<float>(ng * kWindow * C);
-        st.rec_gate = st.arena.take<float>(ng * kWindow * HV);
-        st.rec_beta = st.arena.take<float>(ng * kWindow * HV);
+        if (gdn_alt) st.gdn_alt = st.arena.take<float>(ng * st.gdn_floats);
     }
     const size_t cells = (size_t) m.o.max_context * g.n_kv * g.head_dim;
     // with K/V streaming each layer keeps its first `near` cells here and the rest in page-locked host memory
@@ -146,10 +143,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
             return false;
         }
     }
-    if (head) {
-        st.logits = st.arena.take<float>((size_t) kWindow * g.n_vocab);
-        st.picks = st.arena.take<int32_t>(kWindow);
-    }
+    if (head) st.picks = st.arena.take<int32_t>(kWindow);
     st.n_keep = st.arena.take<int32_t>(4);
     if (!st.n_keep || (ng && !st.gdn) || (!st.kc.empty() && !m.o.kv_int8 && !st.vc.back())) {
         err = m.o.arch + ": a session's buffers do not fit its arena";
@@ -180,6 +174,7 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(Model& m) : m_(m), g_(m.g) {}
     ~Session() override {
+        clear_pending();
         st_.peer.reset();
         free_state(st_);
         if (done_) cudaEventDestroy(done_);
@@ -220,6 +215,7 @@ public:
     // The drafter's chain after `anchor` (the token at `pos`): step 0 pairs main's last normed row (cell pos - 1) with
     // the anchor, each later step its own output with the draft before it; all on the stream, read by draft_end.
     Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        last_logits_ = nullptr;   // block_draft / mtp_window will reuse m_.ws.hl
         if (block_) {
             // the GDN commit runs beside the drafter (which reads none of its rows); the stream waits for it after
             // the drafter's work, so whatever comes next sees the committed state
@@ -382,10 +378,25 @@ public:
         return {};
     }
 
+    Result flush_pending(int64_t pos) override {
+        if (pend_T_ == 0) return {};
+        if (Result r = settle(pos); !r.ok()) return r;
+        // Finish commit_window and block_ctx_window before returning so no other slot's stream can race on shared m_.ws.
+        if (cudaStreamSynchronize(st_.stream) != cudaSuccess)
+            return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        if (st_.peer) {
+            const core::OnDevice on(m_.split_dev);
+            if (cudaStreamSynchronize(st_.peer->stream) != cudaSuccess)
+                return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        }
+        return {};
+    }
+
     Result decode_window(const model::DecodeRequest& r) override {
         if (r.n_tokens < 1 || r.n_tokens > kWindow) return fail(m_.o.arch + ": a decode window of " + std::to_string(r.n_tokens) + " rows");
         if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the window passes the context");
         if (Result s = settle(r.pos); !s.ok()) return s;
+        if (m_.rec_pending != 0) return fail(m_.o.arch + ": another session has uncommitted GDN rows");
         const int T = r.n_tokens;
         int32_t pos3[kWindow * 3];
         for (int t = 0; t < T; ++t) pos3[t * 3] = pos3[t * 3 + 1] = pos3[t * 3 + 2] = (int32_t) (r.pos + t + st_.rope_delta);
@@ -393,10 +404,9 @@ public:
         if (!prepare_draw(r, err)) return fail(err);
         if (drafter_) cudaMemcpyAsync(st_.win_tok, r.tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, st_.stream);
         if (!forward_window(m_, st_, r.tokens, T, r.pos, pos3, err)) return fail(err);
-        last_logits_ = st_.logits;
+        last_logits_ = m_.ws.hl;
         draw(T);
-        pend_pos_ = r.pos;
-        pend_T_ = T;
+        set_pending(r.pos, T);
         if (r.logits) cudaMemcpyAsync(r.logits, last_logits_ + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4,
                                       cudaMemcpyDeviceToHost, st_.stream);
         cudaMemcpyAsync(h_picks_, st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream);
@@ -448,6 +458,7 @@ public:
             ci += (size_t) ck;
         }
         for (int i = 0; i < n; ++i) ss[(size_t) i]->join_commit(s);
+        if (m_.rec_pending != 0) return fail(m_.o.arch + ": another session has uncommitted GDN rows");
         for (int i = 0; i < n; ++i)
             if (ss[(size_t) i]->st_.peer && cudaStreamSynchronize(ss[(size_t) i]->st_.peer->stream) != cudaSuccess)
                 return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
@@ -475,8 +486,7 @@ public:
             se.last_logits_ = m_.ws.hl + (size_t) row_off * g_.n_vocab;
             row_off += T;
             se.draw(T, s);
-            se.pend_pos_ = r.pos;
-            se.pend_T_ = T;
+            se.set_pending(r.pos, T);
             if (r.logits) cudaMemcpyAsync(r.logits, se.last_logits_ + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, s);
             cudaMemcpyAsync(se.h_picks_, se.st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, s);
         }
@@ -617,7 +627,7 @@ public:
     }
 
     Result running_restored(int64_t pos, const uint8_t* head) override {
-        pend_T_ = 0;
+        clear_pending();
         int64_t h[4];
         std::memcpy(h, head, sizeof h);
         const int64_t W = block_ ? std::min<int64_t>(m_.w.dflash.window, st_.dctx_cap) : 0;
@@ -631,10 +641,11 @@ public:
         return {};
     }
 
-    // No cache to lend: all it holds is state the driver moves to host memory. Both cards' work is finished first.
-    Result set_low_memory(bool, int64_t&) override {
+    // Release the lazy prompt workspace when sleeping (reallocated on the next prompt); both cards finish first.
+    Result set_low_memory(bool low, int64_t&) override {
         cudaStreamSynchronize(st_.stream);
         if (st_.peer) cudaStreamSynchronize(st_.peer->stream);
+        if (low) m_.release_chunk();
         return {};
     }
 
@@ -730,7 +741,7 @@ public:
             }
             if (!ok) return fail(m_.o.arch + ": a parked conversation has other caches");
         }
-        pend_T_ = 0;
+        clear_pending();
         return {};
     }
 
@@ -808,7 +819,7 @@ public:
         }
         st_.alt_ready = false;
         if (st_.peer) st_.peer->alt_ready = false;
-        pend_T_ = 0;
+        clear_pending();
         if (cudaStreamSynchronize(st_.stream) != cudaSuccess)
             return fail(m_.o.arch + ": stream sync failed after slot copy");
         if (st_.peer) {
@@ -828,6 +839,7 @@ public:
     }
 
     Result resample_row(int row, const float* bias, int32_t& token) override {
+        if (!logits_ptr()) return fail("resample_row: logits are no longer live");
         std::string e;
         if (!device_bias(d_mask_, bias, e)) return fail(e);
         kernels::SamplerParams sp = sampling_;
@@ -846,6 +858,7 @@ public:
 
     Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) override {
         if (n <= 0 || row0 < 0 || row0 + n > kWindow) return fail("row_logprobs: rows out of range");
+        if (!logits_ptr()) return fail("row_logprobs: logits are no longer live");
         std::string e;
         if (!lp_buffers(e)) return fail(e);
         float* d_out = lp_buf_ + kernels::row_logprobs_scratch_floats(kWindow, g_.n_vocab);
@@ -860,6 +873,7 @@ public:
     }
 
     Result copy_logits(int row, float* out) override {
+        if (!logits_ptr()) return fail("copy_logits: logits are no longer live");
         cudaStreamSynchronize(st_.stream);
         if (cudaMemcpy(out, logits_ptr() + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
             return fail("the logits copy failed");
@@ -895,7 +909,7 @@ private:
     Result settle(int64_t pos, bool defer = false, cudaStream_t ctx_stream = nullptr,
                   std::vector<BlockCtxSeg>* batch_ctx = nullptr) {
         if (pos == 0) {   // a new conversation: the running state starts empty
-            pend_T_ = 0;
+            clear_pending();
             st_.rope_delta = 0;
             st_.tail_cell = -1;
             st_.dctx_from = 0;
@@ -921,7 +935,7 @@ private:
         const int64_t n = pos - pend_pos_;
         const int T = std::max(pend_T_, 0);
         if (n < 0 || n > T) return fail(m_.o.arch + ": position " + std::to_string((long long) pos) + " is not reachable from the last window");
-        pend_T_ = 0;
+        clear_pending();
         wide_ = n >= std::max(2, m_.w.dflash.block - 2);
         const bool swap = st_.alt_ready && T == 1 && n == 1;
         st_.alt_ready = false;
@@ -1034,7 +1048,17 @@ private:
         return true;
     }
 
-    const float* logits_ptr() const { return last_logits_ ? last_logits_ : st_.logits; }
+    void set_pending(int64_t pos, int T) {
+        if (pend_T_ == 0 && T > 0) ++m_.rec_pending;
+        else if (pend_T_ > 0 && T == 0) --m_.rec_pending;
+        pend_pos_ = pos;
+        pend_T_ = T;
+    }
+    void clear_pending() {
+        if (pend_T_ > 0) --m_.rec_pending;
+        pend_T_ = 0;
+    }
+    const float* logits_ptr() const { return last_logits_; }
     void draw(int T) { draw(T, st_.stream); }
     void draw(int T, cudaStream_t stream) {
         kernels::sample_tokens(logits_ptr(), T, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_,

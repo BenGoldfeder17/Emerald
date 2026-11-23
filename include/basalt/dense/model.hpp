@@ -173,9 +173,10 @@ int64_t resident_cells(int64_t max_context, int64_t kv_resident);
 /// Device bytes one session takes (its KV cells on the card, recurrent states and window rows) on a card that holds layers
 /// [lb, le) (le 0: to the last); the logits and the drafter's state on the card that holds layer 0.
 uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8 = false, int64_t kv_resident = 0, int lb = 0,
-                       int le = 0);
+                       int le = 0, bool gdn_alt = true);
 /// Device bytes one session's cells and recurrent state take in layer `il`.
-uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, bool kv_int8, int64_t kv_resident);
+uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, bool kv_int8, int64_t kv_resident,
+                             bool gdn_alt = true);
 /// Page-locked host bytes one session's streamed K/V takes (0 without streaming).
 uint64_t session_host_bytes(const Geometry& g, int64_t max_context, bool kv_int8, int64_t kv_resident);
 /// Device bytes the model's shared scratch takes (with streaming, the VRAM copy a prompt chunk reads one layer's far cells from).

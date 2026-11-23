@@ -50,12 +50,15 @@ __device__ __forceinline__ void commit_pre_load(const GdnCommitLayers& a, int pe
     const int tid = threadIdx.y * 32 + threadIdx.x;
     const int qk = S * a.h_k;
     const int qh = head % a.h_k;
+    const int h_row = a.h_kv_only ? (a.C - qk) : a.C;
+    const int k_off = a.h_kv_only ? 0 : qk;
+    const int v_off = a.h_kv_only ? qk : 2 * qk;
 #pragma unroll
     for (int t = 0; t < MAXT; ++t) {
         if (t >= n) break;
-        const float* ht = hbuf + (size_t) t * a.C;
-        p.k[t] = ht[qk + qh * S + tid];
-        p.v[t] = ht[2 * qk + head * S + col];
+        const float* ht = hbuf + (size_t) t * h_row;
+        p.k[t] = ht[k_off + qh * S + tid];
+        p.v[t] = ht[v_off + head * S + col];
         p.g[t] = gate[(size_t) t * a.h_v + head];
         p.b[t] = beta[(size_t) t * a.h_v + head];
     }
@@ -119,8 +122,9 @@ __device__ __forceinline__ void commit_layers_body(const GdnCommitLayers& a, int
             commit_pre_run(a, per_layer, n, i, cur);
         } else {
             const int l = i / per_layer, j = i - l * per_layer;
+            const size_t qkv_s = a.qkv_stride ? a.qkv_stride : a.h_stride;
             gdn_conv_commit_n(a.state + (size_t) l * a.state_stride + (size_t) S * a.h_v * S,
-                              a.qkv + (size_t) l * a.h_stride, a.C, n,
+                              a.qkv + (size_t) l * qkv_s, a.C, n,
                               (j - per_state) * 32 * RG + threadIdx.y * 32 + threadIdx.x);
         }
         cur_state = next_state;
