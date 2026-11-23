@@ -189,8 +189,16 @@ ChunkPlan plan_chunk(const Model& m) {
         note(m.w.mtp.layer.gate); note(m.w.mtp.layer.up); note(m.w.mtp.layer.down);
     }
     if (p.block) {
-        for (const Linear& l : m.w.dflash.fc) note(l);
-        for (const BlockDrafter::Layer& D : m.w.dflash.layers) { note(D.k); note(D.v); }
+        for (size_t j = 0; j < m.w.dflash.fc.size(); ++j)
+            note(m.bd_dec.present && m.bd_dec.fc[j].type == kTypeNvfp4Planes ? m.bd_dec.fc[j] : m.w.dflash.fc[j]);
+        for (size_t l = 0; l < m.w.dflash.layers.size(); ++l) {
+            const BlockDrafter::Layer& D =
+                m.bd_dec.present && m.bd_dec.layers[l].k.type == kTypeNvfp4Planes && m.bd_dec.layers[l].v.type == kTypeNvfp4Planes
+                    ? m.bd_dec.layers[l]
+                    : m.w.dflash.layers[l];
+            note(D.k);
+            note(D.v);
+        }
     }
     p.xq_bytes = std::max(max_mmq_cols ? prefill::mmq::q8_bytes(T, (int64_t) max_mmq_cols) : size_t(0),
                           max_fp8_cols ? prefill::fp8::act_bytes(T, (int64_t) max_fp8_cols) : size_t(0));
@@ -296,42 +304,22 @@ bool decode_drafter(Model& m, std::string& err) {
         l.type = kTypeNvfp4Planes;
         return true;
     };
-    auto copy_fp4 = [&](Linear& l) -> bool {
-        if (!q8(l) || !kernels::nvfp4p::fits(l.rows, l.cols)) return copy(l);
-        void* p = nullptr;
-        void* sc = nullptr;
-        if (cudaMalloc(&p, kernels::nvfp4p::bytes(l.rows, l.cols)) != cudaSuccess ||
-            cudaMalloc(&sc, 16) != cudaSuccess) {
-            if (p) cudaFree(p);
-            if (sc) cudaFree(sc);
-            return false;
-        }
-        m.owned.push_back(p);
-        m.owned.push_back(sc);
-        const void* w = l.w;
-        const int rows = l.rows, cols = l.cols;
-        steps.push_back([=](void*) {
-            kernels::nvfp4p::from_q8(w, rows, cols, p, (float*) sc, nullptr);
-            return true;
-        });
-        l.w = p;
-        l.scale = (const float*) sc;
-        l.type = kTypeNvfp4Planes;
-        return true;
+    // Matrices shared with prompt chunks (k, v, fc): convert in place to NVFP4 planes when the shape fits (prompt chunks
+    // run them on fp4_dense directly, saving ~98 MiB of duplicate weights), else keep Q8_0 in w.dflash and copy to Q8P.
+    auto to_fp4_shared = [&](Linear& l) -> bool {
+        return q8(l) && kernels::nvfp4p::fits(l.rows, l.cols) ? to_fp4(l) : copy(l);
     };
     bool ok = true;
     for (BlockDrafter::Layer& D : bd.layers) {
         for (Linear* l : {&D.gate, &D.up, &D.down, &D.q, &D.o}) ok = ok && to_fp4(*l);
         for (Linear* l : {&D.conv_a, &D.conv_f}) ok = ok && in_place(*l);
-        if (kernels::nvfp4p::fits(D.k.rows, D.k.cols) && kernels::nvfp4p::fits(D.v.rows, D.v.cols)) {
-            // k and v as NVFP4 copies (prompt chunks read their blocks), so q, k and v stay one call
-            for (Linear* l : {&D.k, &D.v}) ok = ok && copy_fp4(*l);
+        if (q8(D.k) && q8(D.v) && kernels::nvfp4p::fits(D.k.rows, D.k.cols) && kernels::nvfp4p::fits(D.v.rows, D.v.cols)) {
+            for (Linear* l : {&D.k, &D.v}) ok = ok && to_fp4(*l);
         } else {
             ok = ok && copy(D.k) && copy(D.v);
         }
     }
-    // fc as NVFP4 copies (prompt chunks still read Q8_0 blocks): halves the bytes read on every target verify window
-    for (Linear& l : bd.fc) ok = ok && copy_fp4(l);
+    for (Linear& l : bd.fc) ok = ok && to_fp4_shared(l);
     // optional NVFP4 copy of the FP8 LM head's leading kDraftVocab rows for the drafter pass alone (the target model
     // always verifies against the exact FP8 m.w.head); accounts for sessions, lazy prompt scratch and --vram-reserve-mib
     if (ok && m.w.head.type == kTypeF8) {
@@ -480,8 +468,8 @@ uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv
 
 uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd) {
     if (!bd.present) return 0;
-    return bd.layers.size() * 2 * (uint64_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 + (uint64_t) kWindow * (g.n_embd * 4 + 16) +
-           64 * 256;
+    const uint64_t cells = (uint64_t) (bd.window + 256) * (uint64_t) bd.n_kv * (uint64_t) bd.head_dim;
+    return bd.layers.size() * (2 * (cells + cells / 32) + 4 * 256) + (uint64_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
 }
 
 SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
@@ -561,15 +549,21 @@ bool Model::ready_products(std::string& err) {
     std::vector<const Linear*> ls = {&w.head};
     if (o.drafter == Drafter::Mtp) ls.push_back(&w.mtp.fc);
     if (o.drafter == Drafter::Block) {
-        for (const Linear& l : w.dflash.fc) ls.push_back(&l);
-        for (const BlockDrafter::Layer& D : w.dflash.layers)
-            for (const Linear* l : {&D.q, &D.k, &D.v, &D.o, &D.gate, &D.up, &D.down, &D.conv_a, &D.conv_f}) ls.push_back(l);
+        for (size_t j = 0; j < w.dflash.fc.size(); ++j)
+            ls.push_back(bd_dec.present && bd_dec.fc[j].type == kTypeNvfp4Planes ? &bd_dec.fc[j] : &w.dflash.fc[j]);
+        for (size_t l = 0; l < w.dflash.layers.size(); ++l) {
+            const BlockDrafter::Layer& Dw = w.dflash.layers[l];
+            const BlockDrafter::Layer& Dd = bd_dec.present ? bd_dec.layers[l] : Dw;
+            ls.push_back(Dd.k.type == kTypeNvfp4Planes ? &Dd.k : &Dw.k);
+            ls.push_back(Dd.v.type == kTypeNvfp4Planes ? &Dd.v : &Dw.v);
+            for (const Linear* p : {&Dd.q, &Dd.o, &Dd.gate, &Dd.up, &Dd.down, &Dd.conv_a, &Dd.conv_f}) ls.push_back(p);
+        }
     }
     for (const Layer* Lp : all)
         for (const Linear* l : {&Lp->qkv, &Lp->z, &Lp->out, &Lp->q, &Lp->k, &Lp->v, &Lp->o, &Lp->gate, &Lp->up, &Lp->down})
             if (l->w) ls.push_back(l);
     for (const Linear* l : ls) {
-        if (l->type == kTypeF8 || l->type == kTypeNvfp4Planes) continue;   // the window gemm's, not MMQ's
+        if (l->type == kTypeF8 || l->type == kTypeNvfp4Planes || l->type == kTypeQ8P) continue;   // window_gemm / fp4_dense, not MMQ
         if (!prefill::mmq::fits(l->type, l->rows)) {
             err = o.arch + ": the products have no tile for a " + std::to_string(l->rows) + "-row matrix";
             return false;

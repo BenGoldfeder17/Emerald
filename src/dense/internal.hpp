@@ -225,9 +225,9 @@ struct SessionState {
     float *dlogits = nullptr, *lp = nullptr;     // the drafter's head row and its picks [kWindow][kLogprobStride]
     int32_t* win_tok = nullptr;                  // the last window's tokens (device)
     int64_t tail_cell = -1;
-    // the block drafter: its context K/V per layer (cyclic, dctx_cap cells), the last window's projected features,
+    // the block drafter: its context K/V per layer (cyclic INT8 ring, dctx_cap cells), the last window's projected features,
     // its picks and their confidence, and the proposal each pick came from ([kWindow][top_k] candidates and their q)
-    std::vector<uint16_t*> dk, dv;
+    std::vector<kernels::KvInt8> dkq;
     int64_t dctx_cap = 0, dctx_from = 0;         // cells; the first position its context holds
     float* dacc = nullptr;
     int32_t* dids = nullptr;

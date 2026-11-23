@@ -39,12 +39,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
     }
     // the drafter's state, the logits and the picks on the card that holds layer 0
     const bool head = m.lb == 0, mtp = head && m.o.drafter == Drafter::Mtp, block = head && m.o.drafter == Drafter::Block;
-    size_t blockbytes = 0;
-    if (block) {
-        const BlockDrafter& bd = m.w.dflash;
-        blockbytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
-                      (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
-    }
+    size_t blockbytes = block ? (size_t) block_session_bytes(g, m.w.dflash) : 0;
     const bool gdn_alt = m.o.spec < 2;
     const uint64_t dev_bytes = session_bytes(g, m.o.max_context, mtp, m.o.kv_int8, m.o.kv_resident, m.lb, m.le, gdn_alt);
     if (!st.arena.reserve(dev_bytes + blockbytes)) {
@@ -128,9 +123,18 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
     if (block) {
         const BlockDrafter& bd = m.w.dflash;
         st.dctx_cap = bd.window + 256;
+        const size_t dcells = (size_t) st.dctx_cap * (size_t) bd.n_kv * (size_t) bd.head_dim;
         for (size_t l = 0; l < bd.layers.size(); ++l) {
-            st.dk.push_back(st.arena.take<uint16_t>((size_t) st.dctx_cap * bd.n_kv * bd.head_dim));
-            st.dv.push_back(st.arena.take<uint16_t>((size_t) st.dctx_cap * bd.n_kv * bd.head_dim));
+            kernels::KvInt8 q;
+            q.k = st.arena.take<int8_t>(dcells);
+            q.v = st.arena.take<int8_t>(dcells);
+            q.ks = st.arena.take<uint16_t>(dcells / 64);
+            q.vs = st.arena.take<uint16_t>(dcells / 64);
+            if (!q.vs) {
+                err = m.o.arch + ": the block drafter's context ring does not fit the session's arena";
+                return false;
+            }
+            st.dkq.push_back(q);
         }
         st.dacc = st.arena.take<float>((size_t) kWindow * g.n_embd);
         st.dids = st.arena.take<int32_t>(kWindow);
@@ -592,10 +596,11 @@ public:
     // same position finds every cell where it was; `valid` says how many cells below the position are this
     // conversation's.
     static constexpr size_t kHeadBytes = 4 * sizeof(int64_t);
-    size_t block_ring_bytes() const { return (size_t) st_.dctx_cap * m_.w.dflash.n_kv * m_.w.dflash.head_dim * sizeof(uint16_t); }
+    size_t block_ring_code_bytes() const { return (size_t) st_.dctx_cap * (size_t) m_.w.dflash.n_kv * (size_t) m_.w.dflash.head_dim; }
+    size_t block_ring_scale_bytes() const { return block_ring_code_bytes() / 32; }   // 1 fp16 scale (2 B) per 64 values
     size_t running_bytes() const override {
         return kHeadBytes + (size_t) (m_.n_gdn + (st_.peer ? m_.split_model->n_gdn : 0)) * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
-               (block_ ? st_.dk.size() * 2 * block_ring_bytes() : 0);
+               (block_ ? st_.dkq.size() * 2 * (block_ring_code_bytes() + block_ring_scale_bytes()) : 0);
     }
 
     Result running_state(int64_t pos, bool save, core::RunningState& s) override {
@@ -611,11 +616,15 @@ public:
         s.regions.clear();
         if (const size_t n = (size_t) m_.n_gdn * st_.gdn_floats * 4) s.regions.push_back({st_.gdn, n});
         if (drafter_) s.regions.push_back({st_.tail, (size_t) g_.n_embd * 4});
-        if (block_)
-            for (size_t l = 0; l < st_.dk.size(); ++l) {
-                s.regions.push_back({st_.dk[l], block_ring_bytes()});
-                s.regions.push_back({st_.dv[l], block_ring_bytes()});
+        if (block_) {
+            const size_t cb = block_ring_code_bytes(), sb = block_ring_scale_bytes();
+            for (size_t l = 0; l < st_.dkq.size(); ++l) {
+                s.regions.push_back({st_.dkq[l].k, cb});
+                s.regions.push_back({st_.dkq[l].v, cb});
+                s.regions.push_back({st_.dkq[l].ks, sb});
+                s.regions.push_back({st_.dkq[l].vs, sb});
             }
+        }
         s.stream = st_.stream;
         s.peer_regions.clear();
         if (st_.peer) {   // the second card's layers' state
@@ -807,9 +816,12 @@ public:
                 cudaMemcpyAsync(st_.tail, src->st_.tail, (size_t) g_.n_embd * 4, cudaMemcpyDeviceToDevice, st_.stream) != cudaSuccess)
                 return fail(m_.o.arch + ": copying drafter tail between slots failed");
             if (block_) {
-                for (size_t l = 0; l < st_.dk.size(); ++l) {
-                    if (cudaMemcpyAsync(st_.dk[l], src->st_.dk[l], block_ring_bytes(), cudaMemcpyDeviceToDevice, st_.stream) != cudaSuccess ||
-                        cudaMemcpyAsync(st_.dv[l], src->st_.dv[l], block_ring_bytes(), cudaMemcpyDeviceToDevice, st_.stream) != cudaSuccess)
+                const size_t cb = block_ring_code_bytes(), sb = block_ring_scale_bytes();
+                for (size_t l = 0; l < st_.dkq.size(); ++l) {
+                    if (cudaMemcpyAsync(st_.dkq[l].k, src->st_.dkq[l].k, cb, cudaMemcpyDeviceToDevice, st_.stream) != cudaSuccess ||
+                        cudaMemcpyAsync(st_.dkq[l].v, src->st_.dkq[l].v, cb, cudaMemcpyDeviceToDevice, st_.stream) != cudaSuccess ||
+                        cudaMemcpyAsync(st_.dkq[l].ks, src->st_.dkq[l].ks, sb, cudaMemcpyDeviceToDevice, st_.stream) != cudaSuccess ||
+                        cudaMemcpyAsync(st_.dkq[l].vs, src->st_.dkq[l].vs, sb, cudaMemcpyDeviceToDevice, st_.stream) != cudaSuccess)
                         return fail(m_.o.arch + ": copying block drafter context between slots failed");
                 }
             }

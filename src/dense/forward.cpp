@@ -1001,20 +1001,31 @@ void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size
     ChunkScratch& b = m.cs;
     const cudaStream_t s = st.stream;
     const int H = m.g.n_embd;
-    const Linear& fc = taps.fc[j];
+    const Linear& fc = m.bd_dec.present && m.bd_dec.fc[j].type == kTypeNvfp4Planes ? m.bd_dec.fc[j] : taps.fc[j];
     kernels::to_f32(residual(b), b.xn, (int64_t) T * H, s);   // the target layer's rows for the drafter's fc
+    if (fc.type == kTypeNvfp4Planes) {
+        prefill::fp4_dense::quantize(b.xn, T, H, H, b.a4, b.gs, s);
+        prefill::fp4_dense::product(fc.w, fc.scale, fc.rows, fc.cols, b.a4, b.gs, T, b.dacc, fc.rows, j > 0, s);
+        return;
+    }
     chunk_act(m, b.xn, fc.type, H, T, s);
     gemm(m, fc, j == 0 ? b.dacc : b.tmp, T, s);
     if (j > 0) kernels::add_scaled(b.dacc, b.tmp, nullptr, (int64_t) T * H, s);
 }
 
 void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64_t pos) {
-    const BlockDrafter& bd = m.w.dflash;
+    const bool fp4_kv = m.bd_dec.present && !m.bd_dec.layers.empty() &&
+                        m.bd_dec.layers[0].k.type == kTypeNvfp4Planes && m.bd_dec.layers[0].v.type == kTypeNvfp4Planes;
+    const BlockDrafter& bd = fp4_kv ? m.bd_dec : m.w.dflash;
     ChunkScratch& b = m.cs;
     const cudaStream_t s = st.stream;
     const int H = m.g.n_embd;
-    kernels::rms_norm_rows(dacc, bd.hidden_norm, b.xn, n, H, bd.eps, s);
-    chunk_act(m, b.xn, bd.layers[0].k.type, H, n, s);
+    if (fp4_kv) {
+        prefill::fp4_dense::rms_norm_quantize(dacc, bd.hidden_norm, bd.eps, n, H, b.a4, b.gs, nullptr, s);
+    } else {
+        kernels::rms_norm_rows(dacc, bd.hidden_norm, b.xn, n, H, bd.eps, s);
+        chunk_act(m, b.xn, bd.layers[0].k.type, H, n, s);
+    }
     std::vector<int32_t> p3;
     text_positions(p3, n, pos, 0);
     cudaMemcpyAsync(b.pos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
@@ -1024,7 +1035,7 @@ void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64
         gemm(m, D.k, b.dk, n, s);
         gemm(m, D.v, b.dv, n, s);
         kernels::attn_qk_prepare(nullptr, b.dk, b.dv, nullptr, D.k_norm, bd.eps, rope, b.pos, n, 0, bd.n_kv, nullptr,
-                                 st.dk[l], st.dv[l], pos, s, bd.head_dim, false, st.dctx_cap);
+                                 nullptr, nullptr, pos, s, bd.head_dim, false, st.dctx_cap, nullptr, st.dkq[l]);
     }
 }
 
@@ -1114,7 +1125,7 @@ bool block_ctx_batch(Model& m, const BlockCtxSeg* segs, int S, std::string& err,
             kernels::QkPrepSeg qps[kBatch];
             for (int k = 0; k < S; ++k) {
                 SessionState& st = *segs[k].st;
-                qps[k] = {segs[k].n, st.dk[l], st.dv[l], 0, st.dctx_cap, &b.ctx_pos0[k], {}, {}};
+                qps[k] = {segs[k].n, nullptr, nullptr, 0, st.dctx_cap, &b.ctx_pos0[k], st.dkq[l], {}};
             }
             kernels::attn_qk_prepare_segs(nullptr, b.bk, b.bv, nullptr, D.k_norm, bd.eps, rope, b.bpos, qps, S, 0, bd.n_kv,
                                           nullptr, s, bd.head_dim, false);
@@ -1244,8 +1255,8 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
                 SessionState& st = *sts[k];
                 const int B = widths[k];
                 const int32_t* p0_dev = &b.dwin[k].pos0;
-                qps[k] = {B, st.dk[l], st.dv[l], 0, st.dctx_cap, p0_dev, {}, {}};
-                wsegs[k] = {B, st.dk[l], st.dv[l], 0, 0, 0, st.dctx_cap, p0_dev};
+                qps[k] = {B, nullptr, nullptr, 0, st.dctx_cap, p0_dev, st.dkq[l], {}};
+                wsegs[k] = {B, nullptr, nullptr, 0, 0, 0, st.dctx_cap, p0_dev, st.dkq[l]};
             }
             kernels::attn_qk_prepare_segs(b.bq, b.bk, b.bv, D.q_norm, D.k_norm, bd.eps, rope, b.bpos, qps, S, bd.n_head,
                                           bd.n_kv, b.bqo, s, bd.head_dim, false);

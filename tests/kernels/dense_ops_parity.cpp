@@ -354,6 +354,81 @@ int main() {
         std::printf("gqa_window_attn_segs out16 bitwise diffs: %d%s\n", gqa16_diff, gqa16_diff ? "  FAIL" : "");
         if (gqa16_diff) ++fails;
         cudaFree(dout16);
+        // INT8 cyclic window attention (HD=128) via gqa_window_attn_segs (both FP32 and BF16 out16, with win_dev)
+        basalt::kernels::KvInt8 q8;
+        const size_t ce = (size_t) CAP * NKV * HD;
+        cudaMalloc(&q8.k, ce); cudaMalloc(&q8.v, ce);
+        cudaMalloc(&q8.ks, ce / 64 * 2); cudaMalloc(&q8.vs, ce / 64 * 2);
+        std::vector<int8_t> hk(ce), hv(ce);
+        std::vector<uint16_t> hks(ce / 64), hvs(ce / 64);
+        for (size_t g = 0; g < ce / 64; ++g) {
+            float mk = 0.0f, mv = 0.0f;
+            for (size_t i = 0; i < 64; ++i) {
+                mk = std::max(mk, std::fabs(basalt::kernels::f32_from_f16(kc[g * 64 + i])));
+                mv = std::max(mv, std::fabs(basalt::kernels::f32_from_f16(vc[g * 64 + i])));
+            }
+            hks[g] = basalt::kernels::f16_from_f32(mk / 127.0f);
+            hvs[g] = basalt::kernels::f16_from_f32(mv / 127.0f);
+            const float sk = basalt::kernels::f32_from_f16(hks[g]), sv = basalt::kernels::f32_from_f16(hvs[g]);
+            for (size_t i = 0; i < 64; ++i) {
+                const float fk = basalt::kernels::f32_from_f16(kc[g * 64 + i]);
+                const float fv = basalt::kernels::f32_from_f16(vc[g * 64 + i]);
+                hk[g * 64 + i] = (int8_t) std::clamp(std::lrintf(sk > 0 ? fk / sk : 0.0f), -127l, 127l);
+                hv[g * 64 + i] = (int8_t) std::clamp(std::lrintf(sv > 0 ? fv / sv : 0.0f), -127l, 127l);
+            }
+        }
+        cudaMemcpy(q8.k, hk.data(), ce, cudaMemcpyHostToDevice);
+        cudaMemcpy(q8.v, hv.data(), ce, cudaMemcpyHostToDevice);
+        cudaMemcpy(q8.ks, hks.data(), ce / 64 * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(q8.vs, hvs.data(), ce / 64 * 2, cudaMemcpyHostToDevice);
+        const int32_t win_h[4] = {(int32_t) pos, (int32_t) (pos + B), (int32_t) W, (int32_t) (std::max<int64_t>(0, pos - W + 1) / basalt::kernels::kGqaChunk)};
+        int32_t* dwin = nullptr;
+        cudaMalloc(&dwin, sizeof(win_h));
+        cudaMemcpy(dwin, win_h, sizeof(win_h), cudaMemcpyHostToDevice);
+        basalt::kernels::GqaWinSeg seg8{B, nullptr, nullptr, 0, 0, 0, CAP, dwin, q8};
+        basalt::kernels::gqa_window_attn_segs(dq, NH, NKV, HD, &seg8, 1, dscr, CAP, dout, S);
+        auto out8 = down(dout, (size_t) B * NH * HD);
+        std::vector<double> want8(out8.size());
+        for (int t = 0; t < B; ++t)
+            for (int h = 0; h < NH; ++h) {
+                const int kvh = h / (NH / NKV);
+                const int64_t lo = pos + t - W + 1, hi = pos + B;
+                std::vector<double> s;
+                double mx = -1e300;
+                for (int64_t p = lo; p < hi; ++p) {
+                    const size_t row = (size_t) (p % CAP) * NKV + kvh;
+                    double d = 0;
+                    for (int i = 0; i < HD; ++i) {
+                        const float sk = basalt::kernels::f32_from_f16(hks[row * 2 + i / 64]);
+                        d += (double) q[((size_t) t * NH + h) * HD + i] * (double) ((float) hk[row * HD + i] * sk);
+                    }
+                    s.push_back(d / std::sqrt((double) HD));
+                    mx = std::max(mx, s.back());
+                }
+                double l = 0;
+                for (auto& v : s) { v = std::exp(v - mx); l += v; }
+                for (int i = 0; i < HD; ++i) {
+                    double a = 0;
+                    for (size_t j = 0; j < s.size(); ++j) {
+                        const size_t row = (size_t) ((lo + (int64_t) j) % CAP) * NKV + kvh;
+                        const float sv = basalt::kernels::f32_from_f16(hvs[row * 2 + i / 64]);
+                        a += s[j] * (double) ((float) hv[row * HD + i] * sv);
+                    }
+                    want8[((size_t) t * NH + h) * HD + i] = a / l;
+                }
+            }
+        report("gqa_window_attn_segs i8", out8, want8, 2e-4);
+        uint16_t* dout8_16 = nullptr;
+        cudaMalloc(&dout8_16, (size_t) B * NH * HD * 2);
+        basalt::kernels::gqa_window_attn_segs(dq, NH, NKV, HD, &seg8, 1, dscr, CAP, nullptr, S, dout8_16);
+        auto out8_16 = down(dout8_16, (size_t) B * NH * HD);
+        int gqa8_16_diff = 0;
+        for (size_t i = 0; i < out8.size(); ++i)
+            if (out8_16[i] != bf(out8[i])) ++gqa8_16_diff;
+        std::printf("gqa_window_attn_segs i8 out16 bitwise diffs: %d%s\n", gqa8_16_diff, gqa8_16_diff ? "  FAIL" : "");
+        if (gqa8_16_diff) ++fails;
+        cudaFree(dout8_16); cudaFree(dwin);
+        cudaFree(q8.k); cudaFree(q8.v); cudaFree(q8.ks); cudaFree(q8.vs);
     }
     {   // attn_qk_prepare_segs (HD=256 gated & HD=128 ungated, FP16 and INT8): bitwise vs per-segment attn_qk_prepare
         for (const int hd : {256, 128}) {

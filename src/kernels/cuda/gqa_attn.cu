@@ -1122,13 +1122,15 @@ void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, co
     d.n = n_seg;
     for (int k = 0; k < n_seg; ++k) {
         const GqaWinSeg& g = segs[k];
-        if (g.T < 1 || d.row0[k] + g.T > kGqaMaxWindow || g.cap <= 0 || (!g.win_dev && (g.window <= 0 || g.hi < g.pos0 + g.T))) {
+        if (g.T < 1 || d.row0[k] + g.T > kGqaMaxWindow || g.cap <= 0 || (!g.win_dev && (g.window <= 0 || g.hi < g.pos0 + g.T)) ||
+            (bool(g.q8.k) != bool(segs[0].q8.k))) {
             basalt::log::error("basalt", "gqa_window_attn_segs: invalid segment");
             std::exit(1);
         }
         d.row0[k + 1] = d.row0[k] + g.T;
         d.kc[k] = (const __half*) g.k_cache;
         d.vc[k] = (const __half*) g.v_cache;
+        d.q8[k] = g.q8;
         d.r[k].causal = 0;
         d.r[k].cap = g.cap;
         d.r[k].win_dev = g.win_dev;

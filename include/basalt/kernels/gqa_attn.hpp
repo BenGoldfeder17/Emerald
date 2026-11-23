@@ -82,6 +82,7 @@ struct GqaWinSeg {
     const uint16_t* v_cache = nullptr;
     int64_t pos0 = 0, hi = 0, window = 0, cap = 0;
     const int32_t* win_dev = nullptr;   // device int32[4]: {pos0, hi, window, base}
+    KvInt8 q8 = {};
 };
 void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, const GqaWinSeg* segs, int n_seg,
                           float* scratch, int64_t scratch_cells, float* out, void* stream, uint16_t* out16 = nullptr);
