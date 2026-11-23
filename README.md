@@ -35,9 +35,10 @@ context and thinking off, and each figure is the mean of two runs. More in [Meas
 
 | | |
 |---|---|
-| Works | Qwen3.8-27B (`Qwen3.8-27B-QUASAR-NVFP4.basalt`, with its DFlash 2 drafter): every weight on the GPU, context up to the model's 262,144 tokens, `basalt serve` with the OpenAI-compatible API, tool calls, the conversation cache. |
+| Works | Qwen3.8-27B (`Qwen3.8-27B-QUASAR-NVFP4.basalt`, with its DFlash 2 drafter): every weight on the GPU, context up to the model's 262,144 tokens, `basalt serve` with the OpenAI-compatible API, 4-slot concurrent batching with D2D prefix sharing and prefill/decode interleaving, tool calls, the conversation cache. |
+| Tested on ARM64 | CUDA kernel parity suites (`window_gemm`, `dense_ops`, `gdn_seg_split`, `checkpoint_transfer`), 27B checkpoint save/restore round-trip, 140 temperature-0 bit-exact comparisons, and 4,096-token KV accuracy + 14.5k needle-in-a-haystack checks. |
 | Not available | Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash. They keep their experts in system RAM and compute them with x86 (AVX2, AVX-512) kernels; on ARM64 those kernels are stubs that stop with a message. [Other N1X projects](#other-n1x-projects-built-on-basalt) run Flash-Next. |
-| Not tested | Image and video input, more than one GPU, and Basalt's own test suite and quality gate (perplexity and KLD), none of which have been run on ARM64. |
+| Not tested | Image and video input, more than one GPU, and the upstream BF16 perplexity gate. |
 
 Everything here was built and measured on one laptop. Please report problems with Emerald in this repository, not to Basalt.
 
@@ -46,7 +47,7 @@ Everything here was built and measured on one laptop. Please report problems wit
 No compiler is needed. You need an RTX Spark laptop with the N1X chip running Windows 11 on Arm, a current NVIDIA driver
 (621.24 was used), an ARM64 Python 3.10 or newer, and about 25 GB of free disk for the model.
 
-1. Download `emerald-v0.1.0-windows-arm64.zip` from [Releases](https://github.com/BenGoldfeder17/Emerald/releases/latest) and
+1. Download `emerald-v0.2.0-windows-arm64.zip` from [Releases](https://github.com/BenGoldfeder17/Emerald/releases/latest) and
    unzip it. The executables are not code-signed.
 2. Add NVIDIA's cuBLAS library, which the engine loads at start. Download the `libcublas` archive from
    <https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-arm64/> (13.8.0.4 was used) and copy
@@ -164,6 +165,63 @@ The first column is Emerald with none of its additions switched on, which behave
 - Speeds fall by about 5% as the laptop warms up over back-to-back runs.
 - At the full 262,144-token context a 212,000-token prompt was read cold in 171 s and answered correctly; generation speed
   was the same as at 32,768.
+
+### Multi-slot concurrency and memory (v0.2.0 vs v0.1.0)
+
+v0.2.0 expands dense batching from 16 to 32 rows (`window_gemm`, `gdn_window`, `gqa_attn`, batched `attn_qk_prepare_segs`),
+CUDA-graphs the DFlash 2 drafter, fuses drafter glue ops and top-k `row_logprobs`, adds direct GPU-to-GPU slot prefix sharing
+and chunked prefill/decode interleaving, and cuts DRAM/VRAM overhead (shared batch logits, pooled GDN commit buffers with
+dead-write removal, tighter BF16 prompt scratch, in-place NVFP4 drafter `fc`/`k`/`v`, INT8 drafter context ring, and lazy
+checkpoint pooling with an async pinned bounce buffer). All 140 temperature-0 checks match v0.1.0 bit-for-bit.
+
+| Workload (4-slot 131K ctx, `kv=int8`, `relaxed-drafting=0.2`, `gpu-wait=lazy`) | v0.1.0 | v0.2.0 | Change |
+|---|---:|---:|---|
+| 4× concurrent code (`--parallel 4`) | 124 tok/s (`37–42` each, peak 140) | **164–168 tok/s** (`48–71` each, peak **225**) | **+32% to +35%** |
+| 4× concurrent prose (`temp 0.6`) | 92 tok/s (`24–26` each, peak 100) | **98–100 tok/s** (`25–30` each, peak **112**) | **+7% to +9%** |
+| 4× agents sharing a 9k-token prefix (TTFT) | 3.0 – 10.0 s | **0.3 – 2.3 s** | **5–7× faster** |
+| Active decode during a 23k cold prompt read | Froze 8 – 10.5 s | **Live (11–13 pieces/s, <0.6 s max pause)** | No stall |
+| GPU VRAM under 4-slot workload | ~27.1 – 27.4 GiB | **~25.8 – 25.9 GiB** | **-1.25 to -1.56 GiB** |
+| Free Windows RAM (27B loaded) | 9.7 GB | **14.0 GB** | **+4.3 GB** |
+| Energy per token (4× concurrent code) | ~0.62 J/tok | **~0.31 J/tok** (~52 W / 166 tok/s) | **-50%** |
+
+*Upgrading from v0.1.0:* `kConversationFormat` was bumped from 2 to 3 for the INT8 drafter ring layout, so old disk-cache
+files are automatically dropped and rebuilt cleanly on first start.
+
+### Hardware roofline on the N1X (279 GB/s LPDDR5X, 48 SMs `sm_121a`, ~75 W)
+
+| Stage / Kernel | Measured | % of Hardware Ceiling |
+|---|---:|---:|
+| `F8` LM head (`248320×5120`) | 271 – 280 GB/s | **97 – 100%** of LPDDR5X peak |
+| `F8` GDN `qkv`/`z`, Attn `q`/`o` | 257 – 275 GB/s | **92 – 99%** |
+| `FP4` MLP `gate+up` SwiGLU / `down` (`T=1..16`) | 240 – 264 GB/s | **86 – 95%** |
+| End-to-end solo decode | ~74 ms/round (~17.2 GB bus traffic) | **~82 – 85%** of DRAM peak |
+| Cold prefill (`1.9k – 8.8k` tok, ~54 GFLOP/tok) | 3,434 – 3,746 tok/s (~185 – 200 TFLOPS) | **~93 – 100%** of 75 W compute wall |
+
+### Long-context KV scaling and why Emerald stays on `--kv int8`
+
+Live scaling on `Qwen3.8-27B` (131K context, `--kv fp16` vs `--kv int8`):
+
+| Context | `--kv fp16` Prefill / Decode | `--kv int8` Prefill / Decode | Speedup | Peak VRAM (`fp16` → `int8`) |
+|---|---:|---:|---|---:|
+| 37.0k solo | 2,254 t/s / 22.4 t/s | **2,837 t/s / 29.8 t/s** | +25.9% pp / +33.0% dec | 26.3 → **22.6 GiB** |
+| 74.9k solo | 1,540 t/s / 20.2 t/s | **2,253 t/s / 26.5 t/s** | +46.3% pp / +31.2% dec | 26.3 → **22.6 GiB** |
+| 4× 32.2k (128.8k total) | 1,481 t/s / 8.11 t/s agg | **2,093 t/s / 11.60 t/s agg** | +41.3% pp / +43.0% dec | 27.0 → **23.3 GiB** |
+
+Intrinsic KV accuracy across 4,096 decode-path tokens (2k docs + 2k C++/CUDA, full 248,320-vocab FP64 KL vs `--kv fp16`) and
+a 10-depth 14.5k needle-in-a-haystack benchmark:
+
+| KV Mode | Bytes/tok (16 attn layers) | Agg PPL | ΔPPL % | Mean KL | P99 KL | Top-1 Agree | 14.5k NIAH |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `fp16` (ref) | 64.0 KiB | 4.1621 | +0.000% | 0.00000 | 0.0000 | 100.00% | 10/10 |
+| **`int8` (shipped)** | **33.0 KiB** | **4.1621** | **+0.001%** | **0.00028** | **0.0024** | **99.46%** | **10/10** |
+| `k8v4_asym32` (u4+min/32 V) | 26.5 KiB | 4.1638 | +0.043% | 0.00183 (6.5×) | 0.0152 | 98.39% | 10/10 |
+| `k8v4_sym64` (q4_0-style V) | 25.0 KiB | 4.1579 | -0.100% | 0.00367 (13.1×) | 0.0282 | 98.19% | 10/10 |
+| `k4v4_asym32` (u4+min/32 K+V) | 20.0 KiB | 4.1784 | +0.393% | 0.00383 (13.7×) | 0.0383 | 98.05% | 10/10 |
+| `k4v4_sym64` (q4_0-style K+V) | 17.0 KiB | 4.1760 | +0.335% | 0.00934 (33.4×) | 0.0978 | 96.56% | 10/10 |
+
+`--kv int8` already cuts KV memory by 48.4% (fitting 262K solo in ~26.5 GiB out of 38.4 GiB VRAM) and lifts 75K–128K speed
+by 31%–46% at `0.00028` KL. Dropping further to 4-bit V or K+V multiplies KL divergence 6.5×–33× for <1 GiB saved at 128K
+and ~1%–5% projected decode speed (while losing native INT8 tensor-core `P·V` in prefill), so Emerald stays on `--kv int8`.
 
 ## Other N1X projects built on Basalt
 
