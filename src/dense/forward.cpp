@@ -841,7 +841,6 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
             cudaMemcpyAsync(st.dacc, b.dacc + (size_t) row * H, T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
         if (st.hid)   // the drafter's
             cudaMemcpyAsync(st.hid, b.xn + (size_t) row * H, T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
-        cudaMemcpyAsync(st.logits, b.hl + (size_t) row * g.n_vocab, T * g.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, s);
     }
 }
 

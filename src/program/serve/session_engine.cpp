@@ -51,10 +51,11 @@ public:
             return 1;
         }
         // one policy for the solo windows and one for the batch windows, whose rounds cost differently;
-        // single-GPU, non-KV-streamed dense block-drafter models stream the same weights across an 8-row tile (flat_cost)
+        // solo single-GPU dense block-drafter windows run 1..8 rows in one flat-cost NT=1 tile, while multi-slot
+        // batches scale across NT=2..4 (16 vs 32 rows) and keep cost-aware sizing in bpolicy
         const bool dense_cost = session().flat_draft_cost();
         policy.emplace(session().max_window(), 0.03, true, dense_cost);
-        bpolicy.emplace(session().max_window(), 0.03, true, dense_cost);
+        bpolicy.emplace(session().max_window(), 0.03, true, false);
         if (lookup_on()) sfx.emplace(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         if (o.batch > 0) {
             bs.resize((size_t) o.batch);

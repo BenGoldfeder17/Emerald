@@ -270,6 +270,7 @@ public:
         for (int i = 0; i < count; ++i) {
             ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
             if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return fail(m_.o.arch + ": a draft batch of sessions of another model");
+            ss[(size_t) i]->last_logits_ = nullptr;   // block_draft_batch below will reuse m_.ws.hl
         }
         const cudaStream_t s0 = ss[0]->st_.stream;
         for (int i = 1; i < count; ++i) {
@@ -392,10 +393,11 @@ public:
         if (!prepare_draw(r, err)) return fail(err);
         if (drafter_) cudaMemcpyAsync(st_.win_tok, r.tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, st_.stream);
         if (!forward_window(m_, st_, r.tokens, T, r.pos, pos3, err)) return fail(err);
+        last_logits_ = st_.logits;
         draw(T);
         pend_pos_ = r.pos;
         pend_T_ = T;
-        if (r.logits) cudaMemcpyAsync(r.logits, st_.logits + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4,
+        if (r.logits) cudaMemcpyAsync(r.logits, last_logits_ + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4,
                                       cudaMemcpyDeviceToHost, st_.stream);
         cudaMemcpyAsync(h_picks_, st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream);
         if (!wait_stream(st_.stream, lazy_window_[T])) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
@@ -463,14 +465,19 @@ public:
             segs[(size_t) i] = {&se.st_, T, r.pos};
         }
         if (!forward_batch(m_, segs.data(), n, tokens.data(), pos3.data(), err)) return fail(err);
+        // batch logits stay in m_.ws.hl (skipping up to 64 MB of D2D copies per round); every consumer
+        // (draw, r.logits, resample_row, row_logprobs) runs before the next draft_batch or decode_batch touches b.hl
+        int row_off = 0;
         for (int i = 0; i < n; ++i) {
             Session& se = *ss[(size_t) i];
             const model::DecodeRequest& r = reqs[i];
             const int T = r.n_tokens;
+            se.last_logits_ = m_.ws.hl + (size_t) row_off * g_.n_vocab;
+            row_off += T;
             se.draw(T, s);
             se.pend_pos_ = r.pos;
             se.pend_T_ = T;
-            if (r.logits) cudaMemcpyAsync(r.logits, se.st_.logits + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, s);
+            if (r.logits) cudaMemcpyAsync(r.logits, se.last_logits_ + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, s);
             cudaMemcpyAsync(se.h_picks_, se.st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, s);
         }
         if (!wait_stream(s, lazy_window_[rows])) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
@@ -827,7 +834,7 @@ public:
         sp.logit_bias = d_mask_;
         sp.counter += (uint64_t) row;
         sp.n_drawn = 0;   // the row is drawn again under the mask, whatever its draft was
-        kernels::sample_tokens(st_.logits + (size_t) row * g_.n_vocab, 1, g_.n_vocab,
+        kernels::sample_tokens(logits_ptr() + (size_t) row * g_.n_vocab, 1, g_.n_vocab,
                                history_len_ > 0 ? d_hist_ + (size_t) row * history_len_ : nullptr, history_len_, sp,
                                st_.picks, st_.stream);
         if (cudaMemcpyAsync(h_picks_, st_.picks, sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
@@ -845,7 +852,7 @@ public:
         int32_t* d_picks = reinterpret_cast<int32_t*>(d_out + (size_t) kWindow * kernels::kLogprobStride);
         if (cudaMemcpyAsync(d_picks, picks, (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice, st_.stream) != cudaSuccess)
             return fail("row_logprobs: the picks copy failed");
-        kernels::row_logprobs(st_.logits + (size_t) row0 * g_.n_vocab, n, g_.n_vocab, d_picks, top, d_out, lp_buf_, st_.stream);
+        kernels::row_logprobs(logits_ptr() + (size_t) row0 * g_.n_vocab, n, g_.n_vocab, d_picks, top, d_out, lp_buf_, st_.stream);
         if (cudaMemcpyAsync(out, d_out, (size_t) n * kernels::kLogprobStride * sizeof(float), cudaMemcpyDeviceToHost,
                             st_.stream) != cudaSuccess || cudaStreamSynchronize(st_.stream) != cudaSuccess)
             return fail("row_logprobs: the kernel failed");
@@ -854,7 +861,7 @@ public:
 
     Result copy_logits(int row, float* out) override {
         cudaStreamSynchronize(st_.stream);
-        if (cudaMemcpy(out, st_.logits + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        if (cudaMemcpy(out, logits_ptr() + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
             return fail("the logits copy failed");
         return {};
     }
@@ -1027,9 +1034,10 @@ private:
         return true;
     }
 
+    const float* logits_ptr() const { return last_logits_ ? last_logits_ : st_.logits; }
     void draw(int T) { draw(T, st_.stream); }
     void draw(int T, cudaStream_t stream) {
-        kernels::sample_tokens(st_.logits, T, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_,
+        kernels::sample_tokens(logits_ptr(), T, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_,
                                st_.picks, stream);
     }
 
@@ -1041,6 +1049,7 @@ private:
     Model& m_;
     const Geometry& g_;
     SessionState st_;
+    const float* last_logits_ = nullptr;
     int32_t* h_picks_ = nullptr;
     int32_t* h_dids_ = nullptr;
     float* h_dconf_ = nullptr;
