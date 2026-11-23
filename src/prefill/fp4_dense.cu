@@ -25,7 +25,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <type_traits>
+#include <unordered_map>
+#include <utility>
 
 #include "basalt/log.hpp"
 
@@ -617,6 +620,42 @@ TmaDesc map_2d(const void* base, uint64_t cols, uint64_t rows, uint64_t stride, 
     return d;
 }
 
+// Static weight matrices never change address or shape during an engine process: cache their two TMA descriptors
+// (codes + scales) instead of re-encoding them via the CUDA driver on every prompt chunk.
+struct WeightMapKey {
+    const void* base;
+    int64_t rows, K;
+    int loaded_rows;
+    bool operator==(const WeightMapKey& o) const {
+        return base == o.base && rows == o.rows && K == o.K && loaded_rows == o.loaded_rows;
+    }
+};
+struct WeightMapHash {
+    size_t operator()(const WeightMapKey& k) const {
+        size_t h = (size_t) reinterpret_cast<uintptr_t>(k.base);
+        h ^= (size_t) k.rows * 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h ^= (size_t) k.K * 0x517cc1b727220a95ull + (h << 6) + (h >> 2);
+        h ^= (size_t) k.loaded_rows + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+std::pair<TmaDesc, TmaDesc> cached_weight_maps(const uint8_t* wb, int64_t rows, int64_t K, int loaded_rows) {
+    static std::mutex mu;
+    static std::unordered_map<WeightMapKey, std::pair<TmaDesc, TmaDesc>, WeightMapHash> cache;
+    const WeightMapKey key{wb, rows, K, loaded_rows};
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        const auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+    }
+    const TmaDesc codes = map_2d(wb, K / 2, rows, K / 2, 64, loaded_rows, CU_TENSOR_MAP_SWIZZLE_64B,
+                                 CU_TENSOR_MAP_L2_PROMOTION_L2_128B, "weight codes");
+    const TmaDesc scales = map_2d(wb + rows * K / 2, 16, (uint64_t) rows * K / 256, 16, 16, 64,
+                                  CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, "weight scales");
+    std::lock_guard<std::mutex> lock(mu);
+    return cache.emplace(key, std::make_pair(codes, scales)).first->second;
+}
+
 int64_t padded(int64_t tokens) { return (tokens + kBT - 1) / kBT * kBT; }
 
 template <bool SWIGLU, bool ADD, bool BF = false> void launch(Params p, const void* w0, const void* w1, int64_t rows, int64_t K,
@@ -637,10 +676,9 @@ template <bool SWIGLU, bool ADD, bool BF = false> void launch(Params p, const vo
                         CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, "activation scales");
     const void* w[2] = {w0, w1};
     for (int b = 0; b < (SWIGLU ? 2 : 1); ++b) {
-        const uint8_t* wb = (const uint8_t*) w[b];
-        p.b_codes[b] = map_2d(wb, K / 2, rows, K / 2, 64, loaded_rows, CU_TENSOR_MAP_SWIZZLE_64B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, "weight codes");
-        p.b_scales[b] = map_2d(wb + rows * K / 2, 16, (uint64_t) rows * K / 256, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE,
-                               CU_TENSOR_MAP_L2_PROMOTION_NONE, "weight scales");
+        const auto [wc, ws] = cached_weight_maps((const uint8_t*) w[b], rows, K, loaded_rows);
+        p.b_codes[b] = wc;
+        p.b_scales[b] = ws;
     }
     if constexpr (SWIGLU || BF) {   // the BF16 rows a block's tile is stored to (and, for the add, loaded from)
         const void* out = SWIGLU ? (const void*) p.hdst : (const void*) p.dst;

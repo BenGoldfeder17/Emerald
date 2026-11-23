@@ -21,6 +21,8 @@ void add_scaled(float* x, const float* y, const float* scale, int64_t n, void* s
 void add_scaled(uint16_t* x, const float* y, const float* scale, int64_t n, void* stream);
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream);
 void to_f32(const uint16_t* x, float* y, int64_t n, void* stream);
+/// Direct BF16 -> BF16 embedding row gather: out[t][c] = embd[tok[t]][c] for T rows of H values (H a multiple of 8).
+void embed_rows_bf16(const uint16_t* embd, const int32_t* tok, int T, int H, uint16_t* out, void* stream);
 /// rms_norm_rows of BF16 rows (FP32 math and output).
 void rms_norm_rows(const uint16_t* x, const float* w, float* out, int64_t rows, int64_t cols, float eps, void* stream);
 /// y[i] *= scale  (n values).

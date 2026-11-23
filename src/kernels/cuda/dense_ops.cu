@@ -91,6 +91,16 @@ __global__ void to_f32_kernel(const __nv_bfloat16* __restrict__ x, float* __rest
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __bfloat162float(x[i]);
 }
+__global__ void embed_rows_bf16_kernel(const uint16_t* __restrict__ embd, const int32_t* __restrict__ tok, int H8,
+                                       uint16_t* __restrict__ out) {
+    pdl_launch_dependents();
+    const int t = (int) blockIdx.y;
+    const int j = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= H8) return;
+    const int64_t id = (int64_t) tok[t];
+    reinterpret_cast<uint4*>(out + (int64_t) t * (H8 * 8))[j] =
+        reinterpret_cast<const uint4*>(embd + id * (H8 * 8))[j];
+}
 
 __global__ void scale_values_kernel(float* __restrict__ y, const float* __restrict__ scale, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -551,6 +561,13 @@ void to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;
     to_f32_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(reinterpret_cast<const __nv_bfloat16*>(x), y, n);
     check("to_f32");
+}
+void embed_rows_bf16(const uint16_t* embd, const int32_t* tok, int T, int H, uint16_t* out, void* stream) {
+    if (T <= 0 || H <= 0) return;
+    const int H8 = H / 8;
+    launch_pdl(embed_rows_bf16_kernel, dim3(blocks_for(H8, 256), (unsigned) T), dim3(256), 0, (cudaStream_t) stream,
+               embd, tok, H8, out);
+    check("embed_rows_bf16");
 }
 
 void scale_values(float* y, const float* scale, int64_t n, void* stream) {

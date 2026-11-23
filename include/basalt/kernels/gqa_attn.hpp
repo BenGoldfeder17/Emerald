@@ -20,7 +20,7 @@
 
 namespace basalt::kernels {
 
-constexpr int kGqaMaxWindow = 16;
+constexpr int kGqaMaxWindow = 32;
 
 /// An int8 K/V cache in place of the fp16 one: codes [cell][n_kv][256], fp16 scales [cell][n_kv][4] (one per 64 values,
 /// amax / 127, codes rounded to nearest).  `k` null: the fp16 cache.
@@ -73,6 +73,17 @@ void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* se
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
                      int64_t pos0, int T, int64_t hi, int64_t window, int64_t cap, float* scratch, int64_t scratch_cells,
                      float* out, void* stream);
+/// Batched gqa_window_attn for S sessions in one launch; each segment's {pos0, hi, window, base} may be read from
+/// `win_dev` (device int32[4]) so the launch can be captured in a CUDA graph.  At most kGqaMaxWindow rows in all.
+struct GqaWinSeg {
+    int T = 0;
+    const uint16_t* k_cache = nullptr;
+    const uint16_t* v_cache = nullptr;
+    int64_t pos0 = 0, hi = 0, window = 0, cap = 0;
+    const int32_t* win_dev = nullptr;   // device int32[4]: {pos0, hi, window, base}
+};
+void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, const GqaWinSeg* segs, int n_seg,
+                          float* scratch, int64_t scratch_cells, float* out, void* stream);
 /// The device whose SM count plans the int8 prompt attention's launch (its key splits, so its rounding); -1 (the default):
 /// the current one.  A card that reads some of the main card's layers plans as the main card, so its rows are the main card's.
 void gqa_prompt_plan_device(int device);

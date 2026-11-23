@@ -211,6 +211,13 @@ public:
     virtual size_t cells_bytes(int64_t positions) const { (void) positions; return 0; }
     virtual Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) { (void) kv; (void) positions; return {Status::NotImplemented, "this model keeps no cells"}; }
     virtual Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) { (void) kv; (void) positions; return {Status::NotImplemented, "this model keeps no cells"}; }
+    /// Direct device-to-device copy of positional cells 0..positions-1 (and running state when `copy_running` is true)
+    /// from another session of the same model.
+    virtual bool can_copy_from() const { return false; }
+    virtual Result copy_from(ModelSession& src, int64_t positions, bool copy_running) {
+        (void) src; (void) positions; (void) copy_running;
+        return {Status::NotImplemented, "this model's slots copy no cells"};
+    }
     /// The tokens the session holds from now on, position by position (a restored conversation's).
     virtual Result set_history(const int32_t* tokens, int64_t n) { (void) tokens; (void) n; return {}; }
     /// What `PROBE rates` measures this model's paths with (after prepare).

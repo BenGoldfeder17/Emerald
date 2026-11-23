@@ -273,14 +273,28 @@ public:
             if (!disk_has(s.live.ids, s.live.imgs, s.checkpoints, s.cvec)) disk.put(std::move(s), kDiskQueueCap);
         return true;
     }
-    bool copy_from_slot(int, const ConvCheckpoint*, std::string& e) override { e = "this model's slots copy no cells"; return false; }
+    bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) override {
+        ckd_finish();
+        if (b < 0 || b >= (int) sessions_.size() || b == active_) {
+            e = "invalid source slot for copy";
+            return false;
+        }
+        const int64_t positions = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
+        basalt::model::Result r = session().copy_from(*sessions_[(size_t) b], positions, at == nullptr);
+        if (r.ok() && at != nullptr) r = restore_running_from(at->state_a, positions);
+        if (!r.ok()) {
+            e = r.message;
+            return false;
+        }
+        return true;
+    }
     // slot 0 is the solo session, the only way a request reaches this with its state elsewhere
     bool copy_to_slot(int b, const std::vector<int32_t>&, std::string& e) override {
         if (b == 0) return true;
         e = "this model's slots copy no cells";
         return false;
     }
-    bool slots_share_cells() const override { return false; }
+    bool slots_share_cells() const override { return !sessions_.empty() && sessions_[0]->can_copy_from(); }
     int64_t slot_context(int) const override { return o.max_context; }
     bool slot0_solo() const override { return o.batch > 0; }
 
@@ -354,6 +368,7 @@ public:
     }
 
     basalt::model::ModelSession& session() { return *sessions_[(size_t) active_]; }
+    int active() const { return active_; }
     void set_active(int slot) { active_ = slot; }
     void set_slot_sampling(int slot, const basalt::kernels::SamplerParams& sp) { slot_sampling_[(size_t) slot] = sp; }
     const basalt::model::ModelDesc& desc() const { return model_.desc(); }
@@ -870,12 +885,50 @@ bool SessionRuntime::next_batch_window() {
         set_active(0);
         return true;
     }
-    // the windows of a round share the batch's rows: with no more slots than rows each takes its share, so one pass serves all
+    // the windows of a round share the batch's rows: with no more slots than rows each takes its share, so one pass serves all.
+    // Above 16 total rows (NT = 3 or 4 in window_gemm), trim low-probability tail drafts (joint acceptance < 0.20) so
+    // low-acceptance batches (e.g. sampled prose) stay in the fast 16-row tile instead of paying 24/32-row compute for
+    // drafts unlikely to be reached, while high-acceptance batches (code) use the full 32-row batch.
     const int n_act = (int) act.size();
+    std::vector<int> limits((size_t) n_act);
+    std::vector<int> want_t((size_t) n_act);
+    int total_t = 0;
+    for (int i = 0; i < n_act; ++i) {
+        const int b = act[(size_t) i];
+        const BSlot& sl = bs[(size_t) b];
+        const int share = batch_share(i, n_act, cap);
+        const int most = (int) std::min<int64_t>({(int64_t) sessions_[(size_t) b]->max_window(), o.max_context - sl.p,
+                                                  (int64_t) std::size(sl.dr) + 1, (int64_t) share});
+        limits[(size_t) i] = share;
+        want_t[(size_t) i] = std::max(1, std::min(bpolicy->window(sl.dprob, sl.n_dr), most));
+        total_t += want_t[(size_t) i];
+    }
+    if (n_act >= 2 && total_t > 16) {
+        constexpr double kBatchTailMinJoint = 0.20;
+        while (total_t > 16) {
+            int worst = -1;
+            double worst_p = kBatchTailMinJoint;
+            for (int i = 0; i < n_act; ++i) {
+                if (want_t[(size_t) i] <= 1) continue;
+                const BSlot& sl = bs[(size_t) act[(size_t) i]];
+                if (sl.n_dr < want_t[(size_t) i] - 1) continue;
+                double joint = 1.0;
+                for (int j = 0; j < want_t[(size_t) i] - 1; ++j) joint *= bpolicy->chance_rate(sl.dprob[j]);
+                if (joint < worst_p) {
+                    worst_p = joint;
+                    worst = i;
+                }
+            }
+            if (worst < 0) break;
+            --want_t[(size_t) worst];
+            --total_t;
+        }
+        for (int i = 0; i < n_act; ++i) limits[(size_t) i] = want_t[(size_t) i];
+    }
     std::vector<SlotWin> wins(act.size());
     std::vector<int> rows(act.size());
     for (int i = 0; i < n_act; ++i) {
-        slot_window_begin(act[(size_t) i], wins[(size_t) i], batch_share(i, n_act, cap));
+        slot_window_begin(act[(size_t) i], wins[(size_t) i], limits[(size_t) i]);
         rows[(size_t) i] = wins[(size_t) i].T;
     }
     for (const std::vector<size_t>& group : batch_groups(rows, cap)) {
@@ -986,6 +1039,12 @@ Flow SessionRequest::read_to(int64_t to) {
                 const int64_t next = read_from + ((at - read_from) / every + 1) * every;
                 if (next + 256 < end) stride_at = end = next;
             }
+            // While other batch slots are actively decoding, slice long prompt reads into 1024-token chunks so
+            // decoding slots receive windows continuously instead of freezing for the whole prompt read.
+            if (rt_.batch_on() && end - at > 1024) {
+                end = at + 1024;
+                if (stride_at != end) stride_at = -1;
+            }
             basalt::model::PrefillRequest pr;
             pr.tokens = ids32.data() + at;
             pr.n_tokens = (int) (end - at);
@@ -1017,6 +1076,13 @@ Flow SessionRequest::read_to(int64_t to) {
         }
         if (runtime_.halted()) { cancelled = true; return Flow::quit; }
         progress_line("PP", at);
+        if (rt_.batch_on() && at < to && !runtime_.halted()) {
+            const int saved = rt_.active();
+            for (int w = 0; w < 2 && rt_.batch_on(); ++w) {
+                if (!rt_.next_batch_window()) { rt_.set_active(saved); return Flow::error; }
+            }
+            rt_.set_active(saved);
+        }
     }
     if (part_checkpoint(to) &&
         !rt_.checkpoint_at(to, to == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd, ids)) {

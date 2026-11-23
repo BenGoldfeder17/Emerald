@@ -78,11 +78,9 @@ const void* wnorm(Model& m, const uint16_t* x, const float* w, float* xn, int ty
     kernels::rms_norm_rows(x, w, xn, T, cols, eps, s);
     return wact(m, xn, type, cols, T, s);
 }
-// the window's first rows: the embedding (BF16 in the pack) into the BF16 residual, exactly
+// the window's first rows: the embedding (BF16 in the pack) into the BF16 residual directly
 void embed_rows(Model& m, const int32_t* tok, int T, cudaStream_t s) {
-    const int H = m.g.n_embd;
-    kernels::iq_embed_rows(30, m.w.embd, (size_t) H * 2, tok, T, H, m.ws.tmp, s);
-    kernels::to_bf16(m.ws.tmp, m.ws.x, (int64_t) T * H, s);
+    kernels::embed_rows_bf16(m.w.embd, tok, T, m.g.n_embd, m.ws.x, s);
 }
 void mmq_run(Model& m, const Linear& l, const void* xq, float* y, int T, cudaStream_t s) {
     prefill::mmq::Product p;
@@ -1037,16 +1035,16 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
     return chunk_finish(m, st, T, pos, err);
 }
 
-bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err) {
+bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err, cudaStream_t stream) {
     const BlockDrafter& bd = m.bd_dec;
     WindowScratch& b = m.ws;
-    const cudaStream_t s = st.stream;
+    const cudaStream_t s = stream ? stream : st.stream;
     const int H = m.g.n_embd;
     const int32_t bounds[2] = {0, n};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
-    std::vector<int32_t> p3;
-    text_positions(p3, n, pos, 0);
-    cudaMemcpyAsync(b.bpos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    int32_t p3[kWindow * 3];
+    for (int t = 0; t < n; ++t) p3[t * 3] = p3[t * 3 + 1] = p3[t * 3 + 2] = (int32_t) (pos + t);
+    cudaMemcpyAsync(b.bpos, p3, (size_t) n * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     const void* xq = wnorm(m, st.dacc, bd.hidden_norm, b.xn, bd.layers[0].k.type, H, n, bd.eps, s);
     const kernels::RopeSpec rope = block_rope(bd);
     for (size_t l = 0; l < bd.layers.size(); ++l) {
@@ -1073,104 +1071,181 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
     const int groups = H / bd.conv_group;
     // session k's rows: r0[k] .. r0[k] + widths[k] - 1
     int r0[kBatch + 1] = {};
+    Model::BatchKey key;
+    key.reserve((size_t) S);
     for (int k = 0; k < S; ++k) {
         if (widths[k] < bd.block || widths[k] > kWindow) {
             err = "block drafter: a block of " + std::to_string(widths[k]) + " rows";
             return false;
         }
         r0[k + 1] = r0[k] + widths[k];
+        key.emplace_back(sts[k], widths[k]);
     }
     const int R = r0[S];
     if (S < 1 || R > kBatch) {
         err = "block drafter: a batch of " + std::to_string(R) + " rows";
         return false;
     }
-    // each block: its anchor, then mask tokens, at positions pos ..
+    // each block: its anchor, then mask tokens, at positions pos .. ; dynamic window metadata uploaded to b.dwin
     int32_t tok[kBatch];
-    std::vector<int32_t> p3((size_t) R * 3);
+    int32_t p3[kBatch * 3];
+    DraftWin dwin[kBatch];
     for (int k = 0; k < S; ++k) {
         tok[r0[k]] = anchors[k];
         for (int i = 1; i < widths[k]; ++i) tok[r0[k] + i] = bd.mask_id;
         for (int i = 0; i < widths[k]; ++i) {
-            int32_t* q = &p3[(size_t) (r0[k] + i) * 3];
+            int32_t* q = &p3[(r0[k] + i) * 3];
             q[0] = q[1] = q[2] = (int32_t) (pos[k] + i);
         }
-        cudaMemcpyAsync(sts[k]->win_tok, &tok[r0[k]], sizeof(int32_t), cudaMemcpyHostToDevice, s);
+        const int64_t win = std::min<int64_t>(bd.window, pos[k] - sts[k]->dctx_from + 1);
+        const int64_t lo = std::max<int64_t>(0, pos[k] - win + 1);
+        dwin[k] = {(int32_t) pos[k], (int32_t) (pos[k] + widths[k]), (int32_t) win, (int32_t) (lo / 32)};
     }
     const int32_t bounds[2] = {0, R};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.tok, tok, (size_t) R * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-    cudaMemcpyAsync(b.bpos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-    kernels::PdlScope pdl(true, true);   // after the uploads: each product stages its weights during the kernel before
-    embed_rows(m, b.tok, R, s);
-    const kernels::RopeSpec rope = block_rope(bd);
-    // the dynamic convolution runs along each block's own rows into b.bh
-    const auto conv = [&](const float* x, const float* dyn, int64_t ld_dyn, const float* base) {
+    cudaMemcpyAsync(b.bpos, p3, (size_t) R * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(b.dwin, dwin, (size_t) S * sizeof(DraftWin), cudaMemcpyHostToDevice, s);
+
+    const bool skip_anchors = on_wg(m.w.head.type);
+    const int64_t nv = draft_vocab(m);
+    const auto draft_body = [&]() {
         for (int k = 0; k < S; ++k)
-            kernels::dyn_conv2(x + (size_t) r0[k] * H, dyn + (size_t) r0[k] * ld_dyn, ld_dyn, base, b.bh + (size_t) r0[k] * H,
-                               widths[k], H, bd.conv_group, s);
-    };
-    for (size_t l = 0; l < bd.layers.size(); ++l) {
-        const BlockDrafter::Layer& D = bd.layers[l];
-        // attention, its input and output through the dynamic convolution
-        prod(m, D.conv_a, wnorm(m, b.x, D.attn_norm, b.xn, D.conv_a.type, H, R, bd.eps, s), b.dyn, R, s);
-        conv(b.xn, b.dyn, D.conv_a.rows, D.base_a);
-        prod_group(m, b.bh, wact(m, b.bh, D.q.type, H, R, s), D.q.type, {{&D.q, b.bq}, {&D.k, b.bk}, {&D.v, b.bv}}, R, s);
+            cudaMemcpyAsync(sts[k]->win_tok, b.tok + r0[k], sizeof(int32_t), cudaMemcpyDeviceToDevice, s);
+        kernels::PdlScope pdl(true, true);   // after the uploads: each product stages its weights during the kernel before
+        embed_rows(m, b.tok, R, s);
+        const kernels::RopeSpec rope = block_rope(bd);
+        // the dynamic convolution runs along each block's own rows into b.bh
+        const auto conv = [&](const float* x, const float* dyn, int64_t ld_dyn, const float* base) {
+            for (int k = 0; k < S; ++k)
+                kernels::dyn_conv2(x + (size_t) r0[k] * H, dyn + (size_t) r0[k] * ld_dyn, ld_dyn, base, b.bh + (size_t) r0[k] * H,
+                                   widths[k], H, bd.conv_group, s);
+        };
+        for (size_t l = 0; l < bd.layers.size(); ++l) {
+            const BlockDrafter::Layer& D = bd.layers[l];
+            // attention, its input and output through the dynamic convolution
+            prod(m, D.conv_a, wnorm(m, b.x, D.attn_norm, b.xn, D.conv_a.type, H, R, bd.eps, s), b.dyn, R, s);
+            conv(b.xn, b.dyn, D.conv_a.rows, D.base_a);
+            prod_group(m, b.bh, wact(m, b.bh, D.q.type, H, R, s), D.q.type, {{&D.q, b.bq}, {&D.k, b.bk}, {&D.v, b.bv}}, R, s);
+            kernels::GqaWinSeg wsegs[kBatch];
+            for (int k = 0; k < S; ++k) {
+                SessionState& st = *sts[k];
+                const size_t q0 = (size_t) r0[k];
+                const int B = widths[k];
+                const int32_t* p0_dev = &b.dwin[k].pos0;
+                kernels::attn_qk_prepare(b.bq + q0 * AQ, b.bk + q0 * KV, b.bv + q0 * KV, D.q_norm, D.k_norm, bd.eps, rope,
+                                         b.bpos + q0 * 3, B, bd.n_head, bd.n_kv, b.bqo + q0 * AQ, st.dk[l], st.dv[l], 0, s,
+                                         bd.head_dim, false, st.dctx_cap, p0_dev);
+                wsegs[k] = {B, st.dk[l], st.dv[l], 0, 0, 0, st.dctx_cap, p0_dev};
+            }
+            kernels::gqa_window_attn_segs(b.bqo, bd.n_head, bd.n_kv, bd.head_dim, wsegs, S, b.battn, sts[0]->dctx_cap, b.bao, s);
+            prod(m, D.o, wact(m, b.bao, D.o.type, AQ, R, s), b.tmp, R, s);
+            conv(b.tmp, b.dyn + 2 * groups, D.conv_a.rows, D.base_a + 2 * H);
+            kernels::add_scaled(b.x, b.bh, nullptr, (int64_t) R * H, s);
+            // the FFN, likewise (fused SwiGLU straight into BF16 b.hq when down runs on window_gemm)
+            prod(m, D.conv_f, wnorm(m, b.x, D.ffn_norm, b.xn, D.conv_f.type, H, R, bd.eps, s), b.dyn, R, s);
+            conv(b.xn, b.dyn, D.conv_f.rows, D.base_f);
+            if (on_wg(D.down.type)) {
+                prod_swiglu(m, D.gate, D.up, b.bh, wact(m, b.bh, D.gate.type, H, R, s), nullptr, R, s, b.hq);
+                prod(m, D.down, b.hq, b.tmp, R, s);
+            } else {
+                prod_swiglu(m, D.gate, D.up, b.bh, wact(m, b.bh, D.gate.type, H, R, s), b.h, R, s);
+                prod(m, D.down, wact(m, b.h, D.down.type, D.gate.rows, R, s), b.tmp, R, s);
+            }
+            conv(b.tmp, b.dyn + 2 * groups, D.conv_f.rows, D.base_f + 2 * H);
+            kernels::add_scaled(b.x, b.bh, nullptr, (int64_t) R * H, s);
+        }
+        // slots 1 .. B-1 of each block: skip the anchor row (row 0 of each block) before the LM head and selector
+        const uint16_t* x_head = b.x;
+        int R_head = R;
+        if (skip_anchors) {
+            R_head = R - S;
+            if (S == 1) {
+                x_head = b.x + H;
+            } else {
+                uint16_t* dst = reinterpret_cast<uint16_t*>(b.hq);
+                for (int k = 0; k < S; ++k) {
+                    const size_t n_rows = (size_t) (widths[k] - 1);
+                    cudaMemcpyAsync(dst + (size_t) (r0[k] - k) * H, b.x + (size_t) (r0[k] + 1) * H,
+                                    n_rows * (size_t) H * sizeof(uint16_t), cudaMemcpyDeviceToDevice, s);
+                }
+                x_head = dst;
+            }
+        }
+        // the head over the vocabulary's first rows only (a BPE vocabulary's ids run roughly by frequency): its picks there
+        const void* hq = wnorm(m, x_head, bd.norm, b.xn, m.w.head.type, H, R_head, bd.eps, s);
+        if (nv < g.n_vocab) {
+            const Linear& hd = m.w.head;   // its first nv rows: F8 rows (and their scales) lead; planes keep the whole scale plane
+            wg::Call c = wcall(hd);
+            c.m[0] = wmat(hd, b.hl);
+            c.m[0].rows = c.m[0].ld_y = nv;
+            if (hd.type == kTypeNvfp4Planes) c.m[0].scales = (const uint8_t*) hd.w + kernels::nvfp4p::scale_offset(hd.rows, hd.cols);
+            wg::gemm(c, hq, R_head, m.ws.w8, s);
+        } else {
+            prod(m, m.w.head, hq, b.hl, R_head, s);
+        }
+        {   // the selector's projection of every scored row (BF16 weights) on the window gemm (reuses hq when already BF16)
+            wg::Call c;
+            c.fmt = wg::Format::Bf16;
+            c.K = H;
+            c.m[0] = {(const uint8_t*) bd.sel_h, bd.rank, nullptr, b.bsel, bd.rank};
+            if (!on_wg(m.w.head.type)) wg::pack(b.xn, H, H, R_head, b.xq, s);
+            wg::gemm(c, on_wg(m.w.head.type) ? hq : b.xq, R_head, m.ws.w8, s);
+        }
         for (int k = 0; k < S; ++k) {
-            SessionState& st = *sts[k];
+            const size_t out_off = skip_anchors ? (size_t) (r0[k] - k) : (size_t) (r0[k] + 1);
             const size_t q0 = (size_t) r0[k];
             const int B = widths[k];
-            kernels::attn_qk_prepare(b.bq + q0 * AQ, b.bk + q0 * KV, b.bv + q0 * KV, D.q_norm, D.k_norm, bd.eps, rope,
-                                     b.bpos + q0 * 3, B, bd.n_head, bd.n_kv, b.bqo + q0 * AQ, st.dk[l], st.dv[l], pos[k], s,
-                                     bd.head_dim, false, st.dctx_cap);
-            const int64_t window = std::min<int64_t>(bd.window, pos[k] - st.dctx_from + 1);   // context below dctx_from is gone
-            kernels::gqa_window_attn(b.bqo + q0 * AQ, st.dk[l], st.dv[l], bd.n_head, bd.n_kv, bd.head_dim, pos[k], B, pos[k] + B,
-                                     window, st.dctx_cap, b.battn, st.dctx_cap, b.bao + q0 * AQ, s);
+            kernels::row_logprobs(b.hl + out_off * (size_t) nv, B - 1, nv, b.tok + q0 + 1, bd.top_k,
+                                  b.blp + (size_t) (r0[k] - k) * kernels::kLogprobStride, b.lp_scratch, s);
         }
-        prod(m, D.o, wact(m, b.bao, D.o.type, AQ, R, s), b.tmp, R, s);
-        conv(b.tmp, b.dyn + 2 * groups, D.conv_a.rows, D.base_a + 2 * H);
-        kernels::add_scaled(b.x, b.bh, nullptr, (int64_t) R * H, s);
-        // the FFN, likewise
-        prod(m, D.conv_f, wnorm(m, b.x, D.ffn_norm, b.xn, D.conv_f.type, H, R, bd.eps, s), b.dyn, R, s);
-        conv(b.xn, b.dyn, D.conv_f.rows, D.base_f);
-        prod_swiglu(m, D.gate, D.up, b.bh, wact(m, b.bh, D.gate.type, H, R, s), b.h, R, s);
-        prod(m, D.down, wact(m, b.h, D.down.type, D.gate.rows, R, s), b.tmp, R, s);
-        conv(b.tmp, b.dyn + 2 * groups, D.conv_f.rows, D.base_f + 2 * H);
-        kernels::add_scaled(b.x, b.bh, nullptr, (int64_t) R * H, s);
+    };
+
+    bool launched = false;
+    for (Model::BatchGraph& bg : m.draft_graphs) {
+        if (bg.key == key) {
+            bg.used = ++m.draft_clock;
+            if (cudaGraphLaunch(bg.exec, s) != cudaSuccess) return cuda_ok("block drafter graph", err) && false;
+            launched = true;
+            break;
+        }
     }
-    // slots 1 .. B-1 of each block: the head's candidates, then one path through them
-    // the head over the vocabulary's first rows only (a BPE vocabulary's ids run roughly by frequency): its picks there
-    const int64_t nv = draft_vocab(m);
-    const void* hq = wnorm(m, b.x, bd.norm, b.xn, m.w.head.type, H, R, bd.eps, s);
-    if (nv < g.n_vocab) {
-        const Linear& hd = m.w.head;   // its first nv rows: F8 rows (and their scales) lead; planes keep the whole scale plane
-        wg::Call c = wcall(hd);
-        c.m[0] = wmat(hd, b.hl);
-        c.m[0].rows = c.m[0].ld_y = nv;
-        if (hd.type == kTypeNvfp4Planes) c.m[0].scales = (const uint8_t*) hd.w + kernels::nvfp4p::scale_offset(hd.rows, hd.cols);
-        wg::gemm(c, hq, R, m.ws.w8, s);
-    } else {
-        prod(m, m.w.head, hq, b.hl, R, s);
-    }
-    {   // the selector's projection of every row (BF16 weights) on the window gemm
-        wg::Call c;
-        c.fmt = wg::Format::Bf16;
-        c.K = H;
-        c.m[0] = {(const uint8_t*) bd.sel_h, bd.rank, nullptr, b.bsel, bd.rank};
-        wg::pack(b.xn, H, H, R, b.xq, s);
-        wg::gemm(c, b.xq, R, m.ws.w8, s);
+    if (!launched) {
+        draft_body();
+        if (!cuda_ok("block drafter", err)) return false;
+        cudaGraph_t graph = nullptr;
+        if (cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed) == cudaSuccess) {
+            draft_body();
+            cudaGraphExec_t exec = nullptr;
+            if (cudaStreamEndCapture(s, &graph) == cudaSuccess && cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess) {
+                cudaGraphDestroy(graph);
+                if (m.draft_graphs.size() >= Model::kBatchGraphs) {
+                    auto old = std::min_element(m.draft_graphs.begin(), m.draft_graphs.end(),
+                                                [](const Model::BatchGraph& x, const Model::BatchGraph& y) { return x.used < y.used; });
+                    cudaGraphExecDestroy(old->exec);
+                    m.draft_graphs.erase(old);
+                }
+                m.draft_graphs.push_back({std::move(key), exec, ++m.draft_clock});
+            } else {
+                if (graph) cudaGraphDestroy(graph);
+                cudaGetLastError();
+            }
+        } else {
+            cudaGetLastError();
+        }
     }
     for (int k = 0; k < S; ++k) {
-        const size_t q0 = (size_t) r0[k];
+        const size_t out_off = skip_anchors ? (size_t) (r0[k] - k) : (size_t) (r0[k] + 1);
+        const size_t lp_off = (size_t) (r0[k] - k);
         const int B = widths[k];
-        kernels::row_logprobs(b.hl + (q0 + 1) * nv, B - 1, nv, b.tok + q0 + 1, bd.top_k, b.blp, b.lp_scratch, s);
         kernels::CandidateDraw draw;
         draw.temperature = sts[k]->dtemp;
         draw.seed = sts[k]->dseed;
         draw.pos0 = pos[k] + 1;
         draw.q_ids = sts[k]->dq_ids;
         draw.q_p = sts[k]->dq_p;
-        kernels::candidate_path(b.blp, kernels::kLogprobStride, bd.top_k, b.bsel + (q0 + 1) * bd.rank, bd.pred, bd.succ, bd.rank,
+        kernels::candidate_path(b.blp + lp_off * kernels::kLogprobStride, kernels::kLogprobStride, bd.top_k,
+                                b.bsel + out_off * bd.rank, bd.pred, bd.succ, bd.rank,
                                 sts[k]->win_tok, B - 1, sts[k]->dids, sts[k]->dconf, draw, s);
     }
     return cuda_ok("block drafter", err);

@@ -183,6 +183,7 @@ public:
         st_.peer.reset();
         free_state(st_);
         if (done_) cudaEventDestroy(done_);
+        if (sync_ev_) cudaEventDestroy(sync_ev_);
         if (h_picks_) cudaFreeHost(h_picks_);
     }
 
@@ -193,6 +194,10 @@ public:
         if (m_.split && !split_session(m_, st_, err)) return false;
         if (cudaHostAlloc((void**) &h_picks_, kWindow * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess) {
             err = "out of page-locked memory";
+            return false;
+        }
+        if (cudaEventCreateWithFlags(&sync_ev_, cudaEventDisableTiming) != cudaSuccess) {
+            err = "cannot create a CUDA event";
             return false;
         }
         lp_scratch_.resize(1);
@@ -251,9 +256,9 @@ public:
         return {};
     }
 
-    // The block drafter for several sessions in passes of as many blocks as a batch window holds: each session is settled
-    // on its own stream (one after another: they share the window scratch), the passes run on the first one's stream, and
-    // the others' streams wait for them before their draft_end reads.
+    // The block drafter for several sessions in passes of as many blocks as a batch window holds: each session's GDN
+    // commit runs beside the rest on its own side stream, its drafter context update runs sequentially on s0 (sharing
+    // m_.ws without host stalls), the passes run on s0, and the others' streams wait for them via event before draft_end.
     Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
                        int count) override {
         if (count <= 1 || !block_ || 2 * m_.w.dflash.block > kBatch) return ModelSession::draft_batch(peers, anchors, pos, n, count);
@@ -261,9 +266,14 @@ public:
         for (int i = 0; i < count; ++i) {
             ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
             if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return fail(m_.o.arch + ": a draft batch of sessions of another model");
-            if (Result r = ss[(size_t) i]->settle(pos[i], true); !r.ok()) return r;   // its commit beside the rest
-            if (cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
         }
+        const cudaStream_t s0 = ss[0]->st_.stream;
+        for (int i = 1; i < count; ++i) {
+            cudaEventRecord(ss[(size_t) i]->sync_ev_, ss[(size_t) i]->st_.stream);
+            cudaStreamWaitEvent(s0, ss[(size_t) i]->sync_ev_, 0);
+        }
+        for (int i = 0; i < count; ++i)
+            if (Result r = ss[(size_t) i]->settle(pos[i], true, s0); !r.ok()) return r;   // commits on side streams, ctx on s0
         if (!done_ && cudaEventCreateWithFlags(&done_, cudaEventDisableTiming) != cudaSuccess) return fail(m_.o.arch + ": no event");
         std::vector<SessionState*> sts((size_t) count);
         for (int i = 0; i < count; ++i) sts[(size_t) i] = &ss[(size_t) i]->st_;
@@ -277,7 +287,6 @@ public:
             width[(size_t) i] = ss[(size_t) i]->block_width(nn[(size_t) i]);
             if (pos[i] + width[(size_t) i] > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
         }
-        const cudaStream_t s0 = sts[0]->stream;
         for (int i = 0; i < count;) {
             int k = 0, rows = 0;
             while (i + k < count && rows + width[(size_t) (i + k)] <= kBatch) rows += width[(size_t) (i + k++)];
@@ -299,6 +308,8 @@ public:
     };
     bool wait_stream(cudaStream_t s, Lazy& w) {
         if (!m_.o.lazy_wait) return cudaStreamSynchronize(s) == cudaSuccess;
+        if (cudaStreamQuery(s) == cudaSuccess) return true;   // already finished (e.g. peers after a shared draft_batch)
+        (void) cudaGetLastError();
         using Clock = std::chrono::steady_clock;
         const Clock::time_point t0 = Clock::now();
         bool overslept = false;
@@ -387,15 +398,18 @@ public:
             rows += r.n_tokens;
         }
         if (rows > kBatch) return fail(m_.o.arch + ": a batch of " + std::to_string(rows) + " rows");
+        const cudaStream_t s = ss[0]->st_.stream;
+        for (int i = 1; i < n; ++i) {
+            cudaEventRecord(ss[(size_t) i]->sync_ev_, ss[(size_t) i]->st_.stream);
+            cudaStreamWaitEvent(s, ss[(size_t) i]->sync_ev_, 0);
+        }
         for (int i = 0; i < n; ++i)
-            if (Result s = ss[(size_t) i]->settle(reqs[i].pos, true); !s.ok()) return s;   // the commits run side by side
-        for (int i = 0; i < n; ++i) ss[(size_t) i]->join_commit();
+            if (Result st = ss[(size_t) i]->settle(reqs[i].pos, true, s); !st.ok()) return st;   // commits on side streams, ctx on s
+        for (int i = 0; i < n; ++i) ss[(size_t) i]->join_commit(s);
         for (int i = 0; i < n; ++i)
-            if (cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess ||
-                (ss[(size_t) i]->st_.peer && cudaStreamSynchronize(ss[(size_t) i]->st_.peer->stream) != cudaSuccess))
+            if (ss[(size_t) i]->st_.peer && cudaStreamSynchronize(ss[(size_t) i]->st_.peer->stream) != cudaSuccess)
                 return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
         std::string err;
-        const cudaStream_t s = ss[0]->st_.stream;
         for (int i = 0; i < n; ++i) {
             Session& se = *ss[(size_t) i];
             const model::DecodeRequest& r = reqs[i];
@@ -674,6 +688,91 @@ public:
         return {};
     }
 
+    bool can_copy_from() const override { return true; }
+
+    Result copy_from(model::ModelSession& src_base, int64_t positions, bool copy_running) override {
+        Session* src = dynamic_cast<Session*>(&src_base);
+        if (!src || &src->m_ != &m_) return fail(m_.o.arch + ": cannot copy cells from another model");
+        if (positions < 0 || positions > m_.o.max_context) return fail(m_.o.arch + ": copy_from positions out of range");
+        if (copy_running) {
+            if (Result r = src->settle(positions); !r.ok()) return r;
+        }
+        if (cudaStreamSynchronize(src->st_.stream) != cudaSuccess || cudaStreamSynchronize(st_.stream) != cudaSuccess)
+            return fail(m_.o.arch + ": stream sync failed before slot copy");
+        if (src->st_.peer && (cudaStreamSynchronize(src->st_.peer->stream) != cudaSuccess ||
+                              cudaStreamSynchronize(st_.peer->stream) != cudaSuccess))
+            return fail(m_.o.arch + ": peer stream sync failed before slot copy");
+        auto copy_buf = [](void* dst_dev, void* dst_far, const void* src_dev, const void* src_far,
+                           size_t split, size_t total, cudaStream_t s) -> bool {
+            if (split > 0 && cudaMemcpyAsync(dst_dev, src_dev, split, cudaMemcpyDeviceToDevice, s) != cudaSuccess) return false;
+            if (total > split && cudaMemcpyAsync(dst_far, src_far, total - split, cudaMemcpyDefault, s) != cudaSuccess) return false;
+            return true;
+        };
+        if (positions > 0) {
+            for (size_t i = 0; i < kv_layers() + (drafter_ ? 1 : 0); ++i) {
+                const bool mtp = i == kv_layers();
+                size_t j = i;
+                const SessionState& sl = mtp ? src->st_ : src->kv_state(j);
+                size_t dj = i;
+                SessionState& dl = mtp ? st_ : (dj < st_.kc.size() ? st_ : (dj -= st_.kc.size(), *st_.peer));
+                const core::OnDevice on(&dl == &st_ ? -1 : m_.split_dev);
+                const cudaStream_t cs = dl.stream;
+                const bool int8 = !mtp && m_.o.kv_int8;
+                const size_t rows = (size_t) positions * row_bytes(int8);
+                const kernels::KvFar df = mtp ? kernels::KvFar{} : dl.far_kv[dj];
+                const kernels::KvFar sf = mtp ? kernels::KvFar{} : sl.far_kv[j];
+                const size_t split = (size_t) std::min<int64_t>(df.at, positions) * row_bytes(int8);
+                bool ok;
+                if (int8) {
+                    const kernels::KvInt8 &dq = dl.kq[dj], &sq = sl.kq[j];
+                    ok = copy_buf(dq.k, df.q8.k, sq.k, sf.q8.k, split, rows, cs) &&
+                         copy_buf(dq.v, df.q8.v, sq.v, sf.q8.v, split, rows, cs) &&
+                         copy_buf(dq.ks, df.q8.ks, sq.ks, sf.q8.ks, split / 32, rows / 32, cs) &&
+                         copy_buf(dq.vs, df.q8.vs, sq.vs, sf.q8.vs, split / 32, rows / 32, cs);
+                } else {
+                    ok = copy_buf(mtp ? st_.mtp_kc : dl.kc[dj], df.k, mtp ? src->st_.mtp_kc : sl.kc[j], sf.k, split, rows, cs) &&
+                         copy_buf(mtp ? st_.mtp_vc : dl.vc[dj], df.v, mtp ? src->st_.mtp_vc : sl.vc[j], sf.v, split, rows, cs);
+                }
+                if (!ok) return fail(m_.o.arch + ": copying KV cells between slots failed");
+            }
+        }
+        if (copy_running) {
+            if (m_.n_gdn > 0 &&
+                cudaMemcpyAsync(st_.gdn, src->st_.gdn, (size_t) m_.n_gdn * st_.gdn_floats * 4, cudaMemcpyDeviceToDevice, st_.stream) != cudaSuccess)
+                return fail(m_.o.arch + ": copying GDN state between slots failed");
+            if (st_.peer && m_.split_model->n_gdn > 0) {
+                const core::OnDevice on(m_.split_dev);
+                if (cudaMemcpyAsync(st_.peer->gdn, src->st_.peer->gdn, (size_t) m_.split_model->n_gdn * st_.gdn_floats * 4,
+                                    cudaMemcpyDeviceToDevice, st_.peer->stream) != cudaSuccess)
+                    return fail(m_.o.arch + ": copying peer GDN state between slots failed");
+            }
+            if (drafter_ &&
+                cudaMemcpyAsync(st_.tail, src->st_.tail, (size_t) g_.n_embd * 4, cudaMemcpyDeviceToDevice, st_.stream) != cudaSuccess)
+                return fail(m_.o.arch + ": copying drafter tail between slots failed");
+            if (block_) {
+                for (size_t l = 0; l < st_.dk.size(); ++l) {
+                    if (cudaMemcpyAsync(st_.dk[l], src->st_.dk[l], block_ring_bytes(), cudaMemcpyDeviceToDevice, st_.stream) != cudaSuccess ||
+                        cudaMemcpyAsync(st_.dv[l], src->st_.dv[l], block_ring_bytes(), cudaMemcpyDeviceToDevice, st_.stream) != cudaSuccess)
+                        return fail(m_.o.arch + ": copying block drafter context between slots failed");
+                }
+            }
+            st_.rope_delta = src->st_.rope_delta;
+            st_.tail_cell = src->st_.tail_cell;
+            st_.dctx_from = src->st_.dctx_from;
+        }
+        st_.alt_ready = false;
+        if (st_.peer) st_.peer->alt_ready = false;
+        pend_T_ = 0;
+        if (cudaStreamSynchronize(st_.stream) != cudaSuccess)
+            return fail(m_.o.arch + ": stream sync failed after slot copy");
+        if (st_.peer) {
+            const core::OnDevice on(m_.split_dev);
+            if (cudaStreamSynchronize(st_.peer->stream) != cudaSuccess)
+                return fail(m_.o.arch + ": peer stream sync failed after slot copy");
+        }
+        return {};
+    }
+
     Result set_logit_bias(const float* bias) override {
         bias_on_ = bias != nullptr;
         if (!bias_on_) return {};
@@ -735,17 +834,18 @@ public:
 
 private:
     // The last window's accepted rows go into the recurrent state once the next call says where it starts.
-    void join_commit() {
+    void join_commit(cudaStream_t s = nullptr) {
         if (!commit_pending_) return;
-        if (m_.n_gdn) cudaStreamWaitEvent(st_.stream, st_.join, 0);
+        if (m_.n_gdn) cudaStreamWaitEvent(s ? s : st_.stream, st_.join, 0);
         if (st_.peer && m_.split_model->n_gdn) {
             const core::OnDevice on(m_.split_dev);
             cudaStreamWaitEvent(st_.peer->stream, st_.peer->join, 0);
         }
         commit_pending_ = false;
     }
-    // `defer`: the commit's join is left to the caller (join_commit), which queues work beside it first
-    Result settle(int64_t pos, bool defer = false) {
+    // `defer`: the commit's join is left to the caller (join_commit), which queues work beside it first.
+    // `ctx_stream`: optional stream on which block_ctx_window runs (for batched calls sharing m_.ws).
+    Result settle(int64_t pos, bool defer = false, cudaStream_t ctx_stream = nullptr) {
         if (pos == 0) {   // a new conversation: the running state starts empty
             pend_T_ = 0;
             st_.rope_delta = 0;
@@ -799,7 +899,7 @@ private:
         }
         if (block_ && n > 0) {   // the kept rows become the block drafter's context
             std::string err;
-            if (!block_ctx_window(m_, st_, (int) n, pend_pos_, err)) return fail(err);
+            if (!block_ctx_window(m_, st_, (int) n, pend_pos_, err, ctx_stream)) return fail(err);
         }
         if (drafter_ && n > 0) {
             // the drafter's history: the waiting row with the window's first token, then each kept row with the next
@@ -900,6 +1000,7 @@ private:
     bool drafter_ = false, block_ = false;
     int n_draft_ = 0;
     cudaEvent_t done_ = nullptr;   // a batched drafter pass, for the other sessions' streams
+    cudaEvent_t sync_ev_ = nullptr;   // orders a shared batch stream after this session's stream without host sync
     bool commit_pending_ = false;  // the GDN commit runs on st_.side, not yet joined to st_.stream
     bool wide_ = false;            // the last settled window kept most of a block (block - 2 rows or more)
     int64_t pend_pos_ = 0;

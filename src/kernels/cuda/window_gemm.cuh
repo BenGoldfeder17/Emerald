@@ -204,32 +204,36 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
 #pragma unroll
             for (int t = 0; t < NT; ++t) acc[mt][t][0] = acc[mt][t][1] = acc[mt][t][2] = acc[mt][t][3] = 0.0f;
 
-        // the activations of chunk i + 1 load while chunk i computes (not at NT 4: no registers to spare)
+        // the activations of chunk i + 1 load while chunk i computes (for NT <= 2); for NT >= 3 load one 64-K block b
+        // at a time inside the b loop to avoid holding 128+ activation registers live across all KB blocks (register spills)
         constexpr bool kAhead = NT <= 2;
-        uint4 na[KB][NT], nb[KB][NT];
+        uint4 na[kAhead ? KB : 1][kAhead ? NT : 1], nb[kAhead ? KB : 1][kAhead ? NT : 1];
         auto load_x = [&](int i) {
+            if constexpr (kAhead) {
 #pragma unroll
-            for (int b = 0; b < KB; ++b)
+                for (int b = 0; b < KB; ++b)
 #pragma unroll
-                for (int t = 0; t < NT; ++t) {
-                    const uint16_t* xp = xcol[t] + k0 + i * CH + b * 64;
-                    na[b][t] = live[t] ? ld_nc16(xp) : make_uint4(0, 0, 0, 0);
-                    nb[b][t] = live[t] ? ld_nc16(xp + 8) : make_uint4(0, 0, 0, 0);
-                }
+                    for (int t = 0; t < NT; ++t) {
+                        const uint16_t* xp = xcol[t] + k0 + i * CH + b * 64;
+                        na[b][t] = live[t] ? ld_nc16(xp) : make_uint4(0, 0, 0, 0);
+                        nb[b][t] = live[t] ? ld_nc16(xp + 8) : make_uint4(0, 0, 0, 0);
+                    }
+            }
         };
         if constexpr (kAhead) load_x(0);
         for (int i = 0; i < n; ++i, ++q) {
             issue_next();
-            if constexpr (!kAhead) load_x(i);
-            uint4 xa[KB][NT], xb[KB][NT];
+            uint4 xa[kAhead ? KB : 1][kAhead ? NT : 1], xb[kAhead ? KB : 1][kAhead ? NT : 1];
+            if constexpr (kAhead) {
 #pragma unroll
-            for (int b = 0; b < KB; ++b)
+                for (int b = 0; b < KB; ++b)
 #pragma unroll
-                for (int t = 0; t < NT; ++t) {
-                    xa[b][t] = na[b][t];
-                    xb[b][t] = nb[b][t];
-                }
-            if (kAhead && i + 1 < n) load_x(i + 1);
+                    for (int t = 0; t < NT; ++t) {
+                        xa[b][t] = na[b][t];
+                        xb[b][t] = nb[b][t];
+                    }
+                if (i + 1 < n) load_x(i + 1);
+            }
             cp_wait<ST - 1>();
             __syncthreads();
             const uint8_t* sm = smem + (q % ST) * C::kStage + wm * C::MB;
@@ -240,6 +244,15 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                 const uint8_t* q1 = sm + r1l * C::CB;
 #pragma unroll
                 for (int b = 0; b < KB; ++b) {
+                    uint4 xab[NT], xbb[NT];
+                    if constexpr (!kAhead) {
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            const uint16_t* xp = xcol[t] + k0 + i * CH + b * 64;
+                            xab[t] = live[t] ? ld_nc16(xp) : make_uint4(0, 0, 0, 0);
+                            xbb[t] = live[t] ? ld_nc16(xp + 8) : make_uint4(0, 0, 0, 0);
+                        }
+                    }
                     unsigned a0[4], a1[4], a2[4], a3[4];   // step s: rows g, g + 8 at k-slots 2c.., then 2c + 8..
                     if constexpr (kBf16) {   // values 16c .. 16c + 15 as eight bf16 pairs, two 16-byte pieces
                         const int pc = 8 * b + 2 * c;
@@ -296,8 +309,10 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                     }
 #pragma unroll
                     for (int t = 0; t < NT; ++t) {
-                        const unsigned xw[8] = {xa[b][t].x, xa[b][t].y, xa[b][t].z, xa[b][t].w,
-                                                xb[b][t].x, xb[b][t].y, xb[b][t].z, xb[b][t].w};
+                        const uint4 cur_a = kAhead ? xa[kAhead ? b : 0][kAhead ? t : 0] : xab[t];
+                        const uint4 cur_b = kAhead ? xb[kAhead ? b : 0][kAhead ? t : 0] : xbb[t];
+                        const unsigned xw[8] = {cur_a.x, cur_a.y, cur_a.z, cur_a.w,
+                                                cur_b.x, cur_b.y, cur_b.z, cur_b.w};
 #pragma unroll
                         for (int s = 0; s < 4; ++s) mma(acc[mt][t], a0[s], a1[s], a2[s], a3[s], xw[2 * s], xw[2 * s + 1]);
                     }

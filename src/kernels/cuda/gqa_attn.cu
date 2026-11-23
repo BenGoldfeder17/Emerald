@@ -43,8 +43,12 @@ struct Range {
     int64_t pos0 = 0, hi = 0, window = 0, cap = 0;
     int causal = 1, base = 0;
     const int32_t* pos_dev = nullptr;   // pos0 read from the device (a captured window)
+    const int32_t* win_dev = nullptr;   // {pos0, hi, window, base} read from the device (captured block drafter)
 };
-__device__ __forceinline__ int64_t row_pos0(const Range& r) { return r.pos_dev ? (int64_t) *r.pos_dev : r.pos0; }
+__device__ __forceinline__ int64_t row_pos0(const Range& r) {
+    return r.win_dev ? (int64_t) r.win_dev[0] : (r.pos_dev ? (int64_t) *r.pos_dev : r.pos0);
+}
+__device__ __forceinline__ int row_base(const Range& r) { return r.win_dev ? r.win_dev[3] : r.base; }
 // A split cache (KvFar): true when cell c lives in the far buffers, `c` then its row there
 __device__ __forceinline__ bool kv_far(const KvFar& f, int64_t& c) {
     if (c < f.at) return false;
@@ -55,7 +59,7 @@ __device__ __forceinline__ bool kv_far(const KvFar& f, int64_t& c) {
 // The windows one launch takes: segment k is rows [row0[k], row0[k + 1]) of q, the partials and the output, its 16-row
 // tiles of (row, head) pairs [tile0[k], tile0[k + 1]) of the grid, with its own cache and range.  Each block and each
 // merged row computes exactly what a launch of its segment alone would.
-constexpr int kMaxSegs = kGqaMaxWindow;
+constexpr int kMaxSegs = 16;
 struct DecSegs {
     int n = 1;
     int row0[kMaxSegs + 1] = {};
@@ -71,9 +75,12 @@ __device__ __forceinline__ int seg_of(const int* first, int n, int i) {
     while (k + 1 < n && i >= first[k + 1]) ++k;
     return k;
 }
-__device__ __forceinline__ int64_t row_hi(const Range& r, int t) { return r.causal ? row_pos0(r) + t + 1 : r.hi; }
+__device__ __forceinline__ int64_t row_hi(const Range& r, int t) {
+    return r.causal ? row_pos0(r) + t + 1 : (r.win_dev ? (int64_t) r.win_dev[1] : r.hi);
+}
 __device__ __forceinline__ int64_t row_lo(const Range& r, int t) {
-    return r.window > 0 ? max((int64_t) 0, row_pos0(r) + t - r.window + 1) : 0;
+    const int64_t w = r.win_dev ? (int64_t) r.win_dev[2] : r.window;
+    return w > 0 ? max((int64_t) 0, row_pos0(r) + t - w + 1) : 0;
 }
 
 // Block (query head, row t), one thread per dim: the row's splits merged in order.  Splits past the row's last chunk
@@ -88,7 +95,7 @@ __global__ void __launch_bounds__(HD) decode_merge_kernel(const float* part, int
     const int k = seg_of(segs.row0, segs.n, row), t = row - segs.row0[k];
     const Range& r = segs.r[k];
     const float* p = part + ((int64_t) row * n_head + h) * gx * (HD + 2);
-    const int64_t chunks = (row_hi(r, t) + CHUNK - 1) / CHUNK - r.base;   // the row's chunks from the first split's
+    const int64_t chunks = (row_hi(r, t) + CHUNK - 1) / CHUNK - row_base(r);   // the row's chunks from the first split's
     const int used = (int) max((int64_t) 1, min((int64_t) gx, chunks));
     float m = kNeg;
     for (int b = 0; b < used; ++b) m = fmaxf(m, p[(int64_t) b * (HD + 2)]);
@@ -291,7 +298,8 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
     int64_t hi_max = 0;
 #pragma unroll
     for (int i = 0; i < 16; ++i) hi_max = max(hi_max, rhi[i]);
-    const int64_t first_c0 = (int64_t) (r.base + blockIdx.x) * CHUNK;
+    const int base = row_base(r);
+    const int64_t first_c0 = (int64_t) (base + blockIdx.x) * CHUNK;
     const int64_t own = row_pos0(r);   // cells from the window's first position on are this window's (written just before)
     const int pre = (int) max((int64_t) 0, min((int64_t) CHUNK, own - first_c0));
     if ((int) blockIdx.x < n_chunks && first_c0 < hi_max && pre > 0) load_kv(first_c0, hi_max, 0, pre);
@@ -305,14 +313,14 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
 #pragma unroll
     for (int n = 0; n < NT; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
     for (int chunk = blockIdx.x; chunk < n_chunks; chunk += gx) {
-        const int64_t c0 = (int64_t) (r.base + chunk) * CHUNK;
+        const int64_t c0 = (int64_t) (base + chunk) * CHUNK;
         if (c0 >= hi_max) break;   // past every row's cells
         if (staged) commit();
         else load_kv(c0, hi_max, chunk == (int) blockIdx.x ? pre : 0, CHUNK);   // the first chunk's earlier cells are in
         staged = false;
         __syncthreads();
         if (chunk + gx < n_chunks) {   // the chunk after this one, in flight while this one is computed
-            const int64_t c02 = (int64_t) (r.base + chunk + gx) * CHUNK;
+            const int64_t c02 = (int64_t) (base + chunk + gx) * CHUNK;
             if (c02 < hi_max) {
                 fetch(c02, hi_max);
                 staged = true;
@@ -1100,6 +1108,40 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
     }
     if (head_dim == 128) launch_window<128>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream);
     else launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream);
+}
+
+void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, const GqaWinSeg* segs, int n_seg,
+                          float* scratch, int64_t scratch_cells, float* out, void* stream) {
+    if (n_seg < 1 || n_seg > kMaxSegs || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX ||
+        (head_dim != 128 && head_dim != 256)) {
+        basalt::log::error("basalt", "gqa_window_attn_segs: invalid arguments");
+        std::exit(1);
+    }
+    const int n_chunks = (int) ((scratch_cells + CHUNK - 1) / CHUNK) + 1;
+    DecSegs d;
+    d.n = n_seg;
+    for (int k = 0; k < n_seg; ++k) {
+        const GqaWinSeg& g = segs[k];
+        if (g.T < 1 || d.row0[k] + g.T > kGqaMaxWindow || g.cap <= 0 || (!g.win_dev && (g.window <= 0 || g.hi < g.pos0 + g.T))) {
+            basalt::log::error("basalt", "gqa_window_attn_segs: invalid segment");
+            std::exit(1);
+        }
+        d.row0[k + 1] = d.row0[k] + g.T;
+        d.kc[k] = (const __half*) g.k_cache;
+        d.vc[k] = (const __half*) g.v_cache;
+        d.r[k].causal = 0;
+        d.r[k].cap = g.cap;
+        d.r[k].win_dev = g.win_dev;
+        if (!g.win_dev) {
+            d.r[k].pos0 = g.pos0;
+            d.r[k].hi = g.hi;
+            d.r[k].window = g.window;
+            const int64_t lo = std::max<int64_t>(0, g.pos0 - g.window + 1);
+            d.r[k].base = (int) (lo / CHUNK);
+        }
+    }
+    if (head_dim == 128) launch_segs<128>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream);
+    else launch_segs<256>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream);
 }
 
 void gqa_prompt_plan_device(int device) { plan_device.store(device, std::memory_order_relaxed); }

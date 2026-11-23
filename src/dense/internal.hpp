@@ -21,7 +21,7 @@ class CudaEncoder;
 namespace basalt::dense {
 
 constexpr int kWindow = 16;       // rows one session's decode window holds
-constexpr int kBatch = 16;        // rows a batch window (several sessions' windows) holds
+constexpr int kBatch = 32;        // rows a batch window (several sessions' windows) holds
 constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
 constexpr int kDraftQ = 20;       // candidates a block drafter's position keeps at most (its selector's top_k)
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
@@ -54,6 +54,11 @@ struct BatchTable {
     int32_t pos0[kBatch];
 };
 
+/// Dynamic per-session window parameters uploaded once per block_draft_batch call so the drafter pass can be graphed.
+struct DraftWin {
+    int32_t pos0, hi, window, base;
+};
+
 /// The decode window's scratch (kBatch rows).
 struct WindowScratch {
     uint16_t* x = nullptr;                       // the residual rows, BF16 (every add in fp32, rounded once)
@@ -81,6 +86,7 @@ struct WindowScratch {
     float *bq = nullptr, *bk = nullptr, *bv = nullptr, *bqo = nullptr, *bao = nullptr, *dyn = nullptr, *bh = nullptr;
     float *battn = nullptr, *blp = nullptr, *bsel = nullptr;
     int32_t* bpos = nullptr;
+    DraftWin* dwin = nullptr;
 };
 
 /// The prompt chunk's scratch (kChunk rows), its mixer and FFN buffers sharing memory.
@@ -148,6 +154,8 @@ public:
     static constexpr size_t kBatchGraphs = 64;
     std::vector<BatchGraph> batch_graphs;
     uint64_t batch_clock = 0;
+    std::vector<BatchGraph> draft_graphs;
+    uint64_t draft_clock = 0;
     // a batch window's GDN gates run on gate_side beside the qkv/z product, from gate_fork to gate_join
     cudaStream_t gate_side = nullptr;
     cudaEvent_t gate_fork = nullptr, gate_join = nullptr;
@@ -290,7 +298,7 @@ bool prompt_split_read(Stage& stage, Model& main, SessionState& st, const int32_
 void commit_window(Model& m, SessionState& st, int n, cudaStream_t s);
 
 /// The block drafter's context from the last window's first n rows (st.dacc) at positions pos.. .
-bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err);
+bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err, cudaStream_t stream = nullptr);
 /// The block drafter's pass after `anchor` at `pos`: its picks for slots 1 .. block-1 into st.dids / st.dconf.
 /// The block is `width` rows (the drafter's block or wider, up to kWindow: one anchor, then mask tokens).
 bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, int width, std::string& err);
