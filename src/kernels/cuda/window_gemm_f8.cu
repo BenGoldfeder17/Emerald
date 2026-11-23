@@ -10,8 +10,8 @@ constexpr int RS = 64, CH = 128, ST = 4, MW = 1;
 }
 
 template <int KW, int NT> Kernel make_sliced() {
-    // the stages change only the overlap, never the sums: two where few wide blocks stream short slices
-    constexpr int KB = 1, SST = KW == 8 && NT <= 2 ? 2 : 1;
+    // the stages change only the overlap, never the sums: double-buffer KW == 4 (all NT) and NT <= 2
+    constexpr int KB = 1, SST = (KW == 4 || NT <= 2) ? 2 : 1;
     using SC = SlicedCfg<KW, KB, NT, SST>;
     Kernel k;
     k.fn = wgemm_sliced_kernel<KW, KB, NT, SST>;

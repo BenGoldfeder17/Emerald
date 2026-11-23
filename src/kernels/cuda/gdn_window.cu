@@ -147,16 +147,18 @@ __device__ __forceinline__ void norm_q8(const DecRecArgs& a, int t, int head, in
     const float yv = oc * scale * gam * act;
     if (a.y) a.y[(size_t) t * value_dim + head * S + col] = yv;
     if (a.y16) a.y16[(size_t) t * value_dim + head * S + col] = __bfloat16_as_ushort(__float2bfloat16_rn(yv));
-    float amax = fabsf(yv), sum = yv;
+    if (a.yq) {
+        float amax = fabsf(yv), sum = yv;
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o, 32));
-        sum += __shfl_xor_sync(0xffffffffu, sum, o, 32);
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o, 32));
+            sum += __shfl_xor_sync(0xffffffffu, sum, o, 32);
+        }
+        const float d = q8_1_finite(div_approx_ftz(amax, 127.0f));
+        Q81* blk = reinterpret_cast<Q81*>(a.yq) + (size_t) t * (value_dim / 32) + head * (S / 32) + rank;
+        blk->qs[lane] = q8_1_quant_fm(yv, d, amax);
+        if (lane == 0) blk->ds = q8_1_ds(d, sum);
     }
-    const float d = q8_1_finite(div_approx_ftz(amax, 127.0f));
-    Q81* blk = reinterpret_cast<Q81*>(a.yq) + (size_t) t * (value_dim / 32) + head * (S / 32) + rank;
-    blk->qs[lane] = q8_1_quant_fm(yv, d, amax);
-    if (lane == 0) blk->ds = q8_1_ds(d, sum);
 }
 
 // sum of squares over the warp's 32 values, the recurrence's butterfly
@@ -439,7 +441,7 @@ __device__ __forceinline__ DecRecArgs seg_args(const DecRecArgs& a0, const SegRo
     if (a.y) a.y += r0 * vd;
     if (a.y16) a.y16 += r0 * vd;
     if (a.o) a.o += r0 * vd;
-    a.yq = static_cast<char*>(a.yq) + r0 * (vd / 32) * sizeof(Q81);
+    if (a.yq) a.yq = static_cast<char*>(a.yq) + r0 * (vd / 32) * sizeof(Q81);
     return a;
 }
 

@@ -166,6 +166,27 @@ int main() {
         }
         check(same, "untimed: the picks do not depend on the round times");
     }
+    {   // flat_cost (dense GPU-resident model): T = 1..8 share one tile so moderate-confidence drafts take the full 8-row tile,
+        // without needlessly jumping into T = 9..16 when the 8th draft's joint probability does not pay for the second tile
+        DraftPolicy dense(DraftPolicy::kMaxT, 0.03, true, true);
+        const float prose[7] = {0.95f, 0.90f, 0.85f, 0.78f, 0.72f, 0.65f, 0.60f};
+        check(dense.window(prose, 7) == 8, "flat_cost: cold start takes full 8-row tile on prose drafts");
+        auto dense_cost = [](int t) { return t <= 8 ? 67.0 + 0.35 * (t - 1) : 71.5 + 0.45 * (t - 9); };
+        std::mt19937 rng(99);
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        int seen8 = 0;
+        for (int i = 0; i < 200; ++i) {
+            const int t = dense.window(prose, 7);
+            int a = 0;
+            while (a < t - 1 && u(rng) < prose[a]) ++a;
+            dense.observe_window(prose, t, a, dense_cost(t));
+            if (i >= 100 && t == 8) ++seen8;
+        }
+        check(seen8 >= 90, "flat_cost: steady-state prose keeps using the 8-row tile");
+        const float wide_prose[15] = {0.95f, 0.90f, 0.85f, 0.78f, 0.72f, 0.65f, 0.60f,
+                                      0.55f, 0.50f, 0.50f, 0.50f, 0.50f, 0.50f, 0.50f, 0.50f};
+        check(dense.window(wide_prose, 15) == 8, "flat_cost: low tail chance stays in NT=1 tile");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

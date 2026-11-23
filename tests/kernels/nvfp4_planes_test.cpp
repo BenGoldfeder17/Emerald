@@ -4,9 +4,12 @@
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/kernels/nvfp4_planes.hpp"
 
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -50,8 +53,46 @@ int main() {
     std::vector<uint8_t> back(blk.size());
     cudaMemcpy(back.data(), d_b2, back.size(), cudaMemcpyDeviceToHost);
     const bool round = back == blk;
-    const bool ok = bad == 0 && round && cudaGetLastError() == cudaSuccess;
-    std::printf("nvfp4 planes from ggml blocks: %s (%d values differ); back to blocks: %s\n",
-                bad == 0 ? "same values" : "WRONG  FAIL", bad, round ? "bitwise" : "DIFFER  FAIL");
+    // from_f8: both per-row scales (as on an F8 head) and scalar scale reconstruct within NVFP4 quantization error
+    std::vector<uint8_t> f8((size_t) rows * K);
+    for (auto& b : f8) {
+        b = (uint8_t) rng();
+        if ((b & 0x7f) == 0x7f) b = 0;   // finite E4M3
+    }
+    std::vector<float> rsc((size_t) rows);
+    for (int64_t r = 0; r < rows; ++r) rsc[(size_t) r] = 0.002f * (1.0f + (float) (r % 7) * 0.3f);
+    void *d_f8 = nullptr, *d_fp = nullptr;
+    float *d_rsc = nullptr, *d_osc = nullptr;
+    cudaMalloc(&d_f8, f8.size());
+    cudaMalloc(&d_fp, p::bytes(rows, K));
+    cudaMalloc(&d_rsc, rsc.size() * sizeof(float));
+    cudaMalloc(&d_osc, sizeof(float));
+    cudaMemcpy(d_f8, f8.data(), f8.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rsc, rsc.data(), rsc.size() * sizeof(float), cudaMemcpyHostToDevice);
+    p::from_f8(d_f8, nullptr, d_rsc, rows, K, d_fp, d_osc, nullptr);
+    std::vector<uint8_t> fpl(p::bytes(rows, K));
+    float gs = 0.0f;
+    cudaMemcpy(fpl.data(), d_fp, fpl.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&gs, d_osc, sizeof(float), cudaMemcpyDeviceToHost);
+    double num = 0.0, den = 0.0;
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t k = 0; k < K; ++k) {
+            __nv_fp8_e4m3 fv;
+            std::memcpy(&fv, &f8[(size_t) r * K + k], 1);
+            const float want = (float) fv * rsc[(size_t) r];
+            const uint8_t byte = fpl[(size_t) (r * (K / 2) + k / 2)];
+            const int code = (k & 1) ? byte >> 4 : byte & 15;
+            const uint8_t sc = fpl[p::scale_offset(rows, K) + (size_t) p::scale_index(r, k / 16, K)];
+            const float got = e2m1[code] * basalt::ue4m3_to_fp32_half(sc) * 2.0f * gs;
+            num += (double) (got - want) * (got - want);
+            den += (double) want * want;
+        }
+    const double rel_rms = std::sqrt(num / std::max(den, 1e-30));
+    const bool f8_ok = rel_rms < 0.15 && gs > 0.0f;
+    cudaFree(d_f8); cudaFree(d_fp); cudaFree(d_rsc); cudaFree(d_osc); cudaFree(d_b); cudaFree(d_p); cudaFree(d_b2);
+    const bool ok = bad == 0 && round && f8_ok && cudaGetLastError() == cudaSuccess;
+    std::printf("nvfp4 planes from ggml blocks: %s (%d values differ); back to blocks: %s; from_f8 rel_rms=%.4f (%s)\n",
+                bad == 0 ? "same values" : "WRONG  FAIL", bad, round ? "bitwise" : "DIFFER  FAIL", rel_rms,
+                f8_ok ? "ok" : "FAIL");
     return ok ? 0 : 1;
 }

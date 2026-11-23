@@ -327,7 +327,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
         const int64_t rows = a.rows[mat];
         bool final_block = true;
         if (ks > 1) {
-            float* part = a.partial + (int64_t) slice * kRows * a.part_rows + a.row_off[mat];
+            float* part = a.partial + ((int64_t) slice * a.part_rows + a.row_off[mat]) * kRows;
 #pragma unroll
             for (int mt = 0; mt < MW; ++mt)
 #pragma unroll
@@ -336,7 +336,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                     for (int j = 0; j < 4; ++j) {
                         const int col = t * 8 + 2 * c + (j & 1);
                         const int64_t r = row0 + (rw * MW + mt) * 16 + g + 8 * (j >> 1);
-                        if (col < a.T && r < rows) part[col * a.part_rows + r] = acc[mt][t][j];
+                        if (col < a.T && r < rows) part[r * kRows + col] = acc[mt][t][j];
                     }
             __threadfence();
             __syncthreads();
@@ -345,7 +345,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
             final_block = last;
             if (final_block) {
                 __threadfence();
-                const float* base = a.partial + a.row_off[mat];
+                const float* base = a.partial + a.row_off[mat] * kRows;
                 // slice by slice, every element's load of a slice issued together (each element still sums its
                 // slices in order from 0)
 #pragma unroll
@@ -355,7 +355,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
 #pragma unroll
                         for (int j = 0; j < 4; ++j) acc[mt][t][j] = 0.0f;
                 for (int k = 0; k < ks; ++k) {
-                    const float* bk = base + (int64_t) k * kRows * a.part_rows;
+                    const float* bk = base + (int64_t) k * a.part_rows * kRows;
 #pragma unroll
                     for (int mt = 0; mt < MW; ++mt)
 #pragma unroll
@@ -364,7 +364,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                             for (int j = 0; j < 4; ++j) {
                                 const int col = t * 8 + 2 * c + (j & 1);
                                 const int64_t r = row0 + (rw * MW + mt) * 16 + g + 8 * (j >> 1);
-                                if (col < a.T && r < rows) acc[mt][t][j] += __ldcg(bk + (int64_t) col * a.part_rows + r);
+                                if (col < a.T && r < rows) acc[mt][t][j] += __ldcg(bk + r * kRows + col);
                             }
                 }
                 if (threadIdx.x == 0) a.tickets[tile] = 0;

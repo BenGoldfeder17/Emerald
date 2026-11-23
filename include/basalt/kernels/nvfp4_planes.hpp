@@ -46,6 +46,11 @@ void from_blocks(const void* blocks, int64_t rows, int64_t K, void* planes, void
 /// values the UE4M3 scale of their largest |value| / (6 gs), codes value / (scale gs) rounded to E2M1.  For a block
 /// drafter, whose products only shape drafts (every draft is verified exactly).
 void from_q8(const void* q8_blocks, int64_t rows, int64_t K, void* planes, float* scale, void* stream);
+/// An F8_E4M3 matrix (`f8_codes`, rows x K bytes, scaled by per-row `row_scales` [rows] or tensor `scale` [1] or 1)
+/// rounded to NVFP4 planes in `planes` (distinct, `bytes` long) with global scale written to *out_scale (device FP32).
+/// For a block drafter, whose products only shape drafts (every draft is verified exactly).
+void from_f8(const void* f8_codes, const float* scale, const float* row_scales, int64_t rows, int64_t K, void* planes,
+             float* out_scale, void* stream);
 
 /// The ggml NVFP4 blocks of a plane matrix, for products that read blocks (distinct buffers, `bytes` each).
 void to_blocks(const void* planes, int64_t rows, int64_t K, void* blocks, void* stream);

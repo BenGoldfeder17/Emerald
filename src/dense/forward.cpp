@@ -44,8 +44,11 @@ bool on_wg(int type) { return type == kTypeF8 || type == kTypeNvfp4Planes || typ
 // F8 and NVFP4 planes (their products apply it)
 const float* post_scale(const Linear& l) { return l.type == kTypeF8 || l.type == kTypeNvfp4Planes ? nullptr : l.scale; }
 int mmq_tile(int T) { return T <= kNarrow ? kNarrow : kBatch; }
+// the head the block drafter scores: its own NVFP4 copy of the leading rows when made, else the target head
+const Linear& draft_head(const Model& m) { return m.bd_dec.draft_head.w ? m.bd_dec.draft_head : m.w.head; }
 // the vocabulary rows the block drafter's head scores: the first kDraftVocab when the head is in planes or F8, else all
 int64_t draft_vocab(const Model& m) {
+    if (m.bd_dec.draft_head.w) return m.bd_dec.draft_head.rows;
     const Linear& hd = m.w.head;
     return (hd.type == kTypeNvfp4Planes || hd.type == kTypeF8) && hd.rows > kDraftVocab ? kDraftVocab : m.g.n_vocab;
 }
@@ -298,7 +301,7 @@ void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStre
     a.h = st.rec_h + (size_t) gi * kWindow * C;
     a.gate = st.rec_gate + (size_t) gi * kWindow * g.gdn_v_heads;
     a.beta = st.rec_beta + (size_t) gi * kWindow * g.gdn_v_heads;
-    if (on_wg(L.out.type)) a.y16 = (uint16_t*) b.xq;   // the out product's rows
+    if (on_wg(L.out.type)) { a.y16 = (uint16_t*) b.xq; a.y = nullptr; a.yq = nullptr; }   // the out product's rows only
     if (T == 1 && st.gdn_alt) a.state_out = st.gdn_alt + (size_t) gi * st.gdn_floats;   // the state after the row
     kernels::dec_gdn_rec(a, T, s);
     prod_add(m, L.out, on_wg(L.out.type) ? b.xq : wact(m, b.y, L.out.type, g.value_width(), T, s), b.x, T, s);
@@ -596,11 +599,14 @@ namespace {
 // projection into `dacc` (j == 0 writes it, later ones add).
 void win_tap(Model& m, size_t j, const uint16_t* rows16, float* dacc, int T, cudaStream_t s) {
     const Linear& fc = m.bd_dec.fc[j];
-    const void* xq = rows16;
-    if (!on_wg(fc.type)) {
-        kernels::to_f32(rows16, m.ws.tmp, (int64_t) T * fc.cols, s);
-        xq = wact(m, m.ws.tmp, fc.type, fc.cols, T, s);
+    if (on_wg(fc.type)) {
+        wg::Call c = wcall(fc, j == 0 ? wg::Epilogue::Store : wg::Epilogue::Add);
+        c.m[0] = wmat(fc, dacc);
+        wg::gemm(c, rows16, T, m.ws.w8, s);
+        return;
     }
+    kernels::to_f32(rows16, m.ws.tmp, (int64_t) T * fc.cols, s);
+    const void* xq = wact(m, m.ws.tmp, fc.type, fc.cols, T, s);
     prod(m, fc, xq, j == 0 ? dacc : m.ws.tmp, T, s);
     if (j > 0) kernels::add_scaled(dacc, m.ws.tmp, nullptr, (int64_t) T * m.g.n_embd, s);
 }
@@ -788,7 +794,7 @@ void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int S, in
     cudaStreamWaitEvent(s, m.gate_join, 0);
     // the raw output in b.y, normed there in place when the out product reads fp32 rows
     a.o = b.y;
-    if (on_wg(L.out.type)) { a.y16 = (uint16_t*) b.xq; a.y = nullptr; }
+    if (on_wg(L.out.type)) { a.y16 = (uint16_t*) b.xq; a.y = nullptr; a.yq = nullptr; }
     // a block row a segment, its GDN rows straight into its session's store (the commit's)
     // in a graph the recurrence still starts early behind the product (its edge from the gates is programmatic too,
     // and it reads them after its wait); launched directly it follows the join the plain way
@@ -1046,6 +1052,7 @@ bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::strin
     int32_t p3[kWindow * 3];
     for (int t = 0; t < n; ++t) p3[t * 3] = p3[t * 3 + 1] = p3[t * 3 + 2] = (int32_t) (pos + t);
     cudaMemcpyAsync(b.bpos, p3, (size_t) n * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    kernels::PdlScope pdl(true, true);
     const void* xq = wnorm(m, st.dacc, bd.hidden_norm, b.xn, bd.layers[0].k.type, H, n, bd.eps, s);
     const kernels::RopeSpec rope = block_rope(bd);
     for (size_t l = 0; l < bd.layers.size(); ++l) {
@@ -1108,7 +1115,8 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
     cudaMemcpyAsync(b.bpos, p3, (size_t) R * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.dwin, dwin, (size_t) S * sizeof(DraftWin), cudaMemcpyHostToDevice, s);
 
-    const bool skip_anchors = on_wg(m.w.head.type);
+    const Linear& hd = draft_head(m);
+    const bool skip_anchors = on_wg(hd.type);
     const int64_t nv = draft_vocab(m);
     const auto draft_body = [&]() {
         for (int k = 0; k < S; ++k)
@@ -1174,24 +1182,23 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
             }
         }
         // the head over the vocabulary's first rows only (a BPE vocabulary's ids run roughly by frequency): its picks there
-        const void* hq = wnorm(m, x_head, bd.norm, b.xn, m.w.head.type, H, R_head, bd.eps, s);
-        if (nv < g.n_vocab) {
-            const Linear& hd = m.w.head;   // its first nv rows: F8 rows (and their scales) lead; planes keep the whole scale plane
+        const void* hq = wnorm(m, x_head, bd.norm, b.xn, hd.type, H, R_head, bd.eps, s);
+        if (nv < hd.rows) {
             wg::Call c = wcall(hd);
             c.m[0] = wmat(hd, b.hl);
             c.m[0].rows = c.m[0].ld_y = nv;
             if (hd.type == kTypeNvfp4Planes) c.m[0].scales = (const uint8_t*) hd.w + kernels::nvfp4p::scale_offset(hd.rows, hd.cols);
             wg::gemm(c, hq, R_head, m.ws.w8, s);
         } else {
-            prod(m, m.w.head, hq, b.hl, R_head, s);
+            prod(m, hd, hq, b.hl, R_head, s);
         }
         {   // the selector's projection of every scored row (BF16 weights) on the window gemm (reuses hq when already BF16)
             wg::Call c;
             c.fmt = wg::Format::Bf16;
             c.K = H;
             c.m[0] = {(const uint8_t*) bd.sel_h, bd.rank, nullptr, b.bsel, bd.rank};
-            if (!on_wg(m.w.head.type)) wg::pack(b.xn, H, H, R_head, b.xq, s);
-            wg::gemm(c, on_wg(m.w.head.type) ? hq : b.xq, R_head, m.ws.w8, s);
+            if (!on_wg(hd.type)) wg::pack(b.xn, H, H, R_head, b.xq, s);
+            wg::gemm(c, on_wg(hd.type) ? hq : b.xq, R_head, m.ws.w8, s);
         }
         for (int k = 0; k < S; ++k) {
             const size_t out_off = skip_anchors ? (size_t) (r0[k] - k) : (size_t) (r0[k] + 1);

@@ -232,6 +232,7 @@ public:
             const int width = block_width(n);
             if (pos + width > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
             if (!block_draft(m_, st_, anchor, pos, width, err)) return fail(err);
+            draft_rows_ = width;
             n_draft_ = std::min(width - 1, max_window() - 1);
             return {};
         }
@@ -287,16 +288,21 @@ public:
             width[(size_t) i] = ss[(size_t) i]->block_width(nn[(size_t) i]);
             if (pos[i] + width[(size_t) i] > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
         }
+        int total_rows = 0;
         for (int i = 0; i < count;) {
             int k = 0, rows = 0;
             while (i + k < count && rows + width[(size_t) (i + k)] <= kBatch) rows += width[(size_t) (i + k++)];
             if (!block_draft_batch(m_, sts.data() + i, anchors + i, pos + i, width.data() + i, k, err, s0)) return fail(err);
+            total_rows += rows;
             i += k;
         }
         cudaEventRecord(done_, s0);
         for (int i = 1; i < count; ++i) cudaStreamWaitEvent(sts[(size_t) i]->stream, done_, 0);
         for (int i = 0; i < count; ++i) ss[(size_t) i]->join_commit();   // the sessions' commits ran side by side
-        for (int i = 0; i < count; ++i) ss[(size_t) i]->n_draft_ = std::min(share, width[(size_t) i] - 1);   // all the block's, as solo
+        for (int i = 0; i < count; ++i) {
+            ss[(size_t) i]->draft_rows_ = std::min(total_rows, kBatch);
+            ss[(size_t) i]->n_draft_ = std::min(share, width[(size_t) i] - 1);   // all the block's, as solo
+        }
         return {};
     }
 
@@ -313,21 +319,24 @@ public:
         using Clock = std::chrono::steady_clock;
         const Clock::time_point t0 = Clock::now();
         bool overslept = false;
-        if (w.ms >= 3.0) {
-            platform::sleep_precise((int64_t) ((w.ms * 0.88 - 0.5) * 1000.0));
+        const double sleep_ms = w.ms * 0.85 - 1.0;
+        if (sleep_ms >= 2.0) {
+            platform::sleep_precise((int64_t) (sleep_ms * 1000.0));
             overslept = cudaStreamQuery(s) == cudaSuccess;
             if (!overslept) (void) cudaGetLastError();   // "not ready" is no error to keep
         }
         const bool ok = cudaStreamSynchronize(s) == cudaSuccess;
-        if (overslept) w.ms *= 0.8;
+        if (overslept) w.ms *= 0.85;
         else {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            w.ms = w.ms == 0.0 ? ms : 0.7 * w.ms + 0.3 * ms;
+            // adapt down quickly on genuine speedups, up slowly so a single slow outlier does not cause oversleeping
+            const double alpha = ms < w.ms ? 0.5 : 0.15;
+            w.ms = w.ms == 0.0 ? ms : (1.0 - alpha) * w.ms + alpha * ms;
         }
         return ok;
     }
     Lazy lazy_window_[kBatch + 1];   // a decode window's wait, by its rows
-    Lazy lazy_draft_;                // the block drafter's, at draft_end
+    Lazy lazy_draft_[kBatch + 1];    // the block drafter's, at draft_end, by total draft rows
     Lazy lazy_chunk_[65];            // a full prompt chunk's, by where in the context it starts
 
     Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
@@ -335,7 +344,7 @@ public:
             n = std::min(n_draft_, max_n);
             if (cudaMemcpyAsync(ids, st_.dids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
                 cudaMemcpyAsync(conf, st_.dconf, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
-                !wait_stream(st_.stream, lazy_draft_))
+                !wait_stream(st_.stream, lazy_draft_[std::clamp(draft_rows_, 0, kBatch)]))
                 return fail(m_.o.arch + ": the block drafter failed");
             return {};
         }
@@ -1003,6 +1012,7 @@ private:
     int32_t* h_picks_ = nullptr;
     bool drafter_ = false, block_ = false;
     int n_draft_ = 0;
+    int draft_rows_ = 0;
     cudaEvent_t done_ = nullptr;   // a batched drafter pass, for the other sessions' streams
     cudaEvent_t sync_ev_ = nullptr;   // orders a shared batch stream after this session's stream without host sync
     bool commit_pending_ = false;  // the GDN commit runs on st_.side, not yet joined to st_.stream

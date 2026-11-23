@@ -75,6 +75,7 @@ struct BlockDrafter {
     float theta = 0.0f, eps = 1e-6f;
     std::vector<int> target_layers;          ///< the target layers whose outputs it reads, in order
     std::vector<Linear> fc;                  ///< per target layer, its block of the feature projection
+    Linear draft_head;                       ///< optional NVFP4 copy of the head's leading rows (decode_drafter)
     const float *hidden_norm = nullptr, *norm = nullptr;
     std::vector<Layer> layers;
     const uint16_t *sel_h = nullptr, *pred = nullptr, *succ = nullptr;   // bf16 [rank][n_embd], [vocab][rank] x 2

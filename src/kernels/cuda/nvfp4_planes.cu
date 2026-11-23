@@ -82,6 +82,13 @@ __global__ void q8_gs_kernel(const unsigned* __restrict__ amax, float* __restric
     const float a = __uint_as_float(*amax);
     *scale = a > 0.0f ? a / (6.0f * 448.0f) : 1.0f;
 }
+// E2M1 to nearest, ties to the even code, saturating (this file builds for sm_120/121, without the FP4 converts)
+__device__ __forceinline__ uint32_t e2m1_code(float x) {
+    const float a = fabsf(x);
+    const uint32_t c = a <= 0.25f ? 0 : a < 0.75f ? 1 : a <= 1.25f ? 2 : a < 1.75f ? 3 : a <= 2.5f ? 4 : a < 3.5f ? 5 : a <= 5.0f ? 6 : 7;
+    return c | (x < 0.0f && c ? 8u : 0u);
+}
+
 __global__ void q8_to_planes_kernel(const uint8_t* __restrict__ blocks, int64_t rows, int64_t K, const float* __restrict__ scale,
                                     uint8_t* __restrict__ dst) {
     const int64_t ng = K / 16;
@@ -98,16 +105,64 @@ __global__ void q8_to_planes_kernel(const uint8_t* __restrict__ blocks, int64_t 
     const __nv_fp8_storage_t sb = __nv_cvt_float_to_fp8(m / (6.0f * gs), __NV_SATFINITE, __NV_E4M3);
     const float sd = __half2float(__half(__nv_cvt_fp8_to_halfraw(sb, __NV_E4M3)));
     const float inv = sd > 0.0f ? 1.0f / (sd * gs) : 0.0f;
-    // E2M1 to nearest, ties to the even code, saturating (this file builds for sm_120, without the FP4 converts)
-    auto e2m1 = [](float x) -> uint32_t {
-        const float a = fabsf(x);
-        const uint32_t c = a <= 0.25f ? 0 : a < 0.75f ? 1 : a <= 1.25f ? 2 : a < 1.75f ? 3 : a <= 2.5f ? 4 : a < 3.5f ? 5 : a <= 5.0f ? 6 : 7;
-        return c | (x < 0.0f && c ? 8u : 0u);
-    };
     uint32_t w[2] = {0, 0};
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-        const uint32_t c = e2m1(v[2 * j] * inv) | (e2m1(v[2 * j + 1] * inv) << 4);   // value 2j low nibble, 2j + 1 high
+        const uint32_t c = e2m1_code(v[2 * j] * inv) | (e2m1_code(v[2 * j + 1] * inv) << 4);   // value 2j low nibble, 2j + 1 high
+        w[j >> 2] |= c << (8 * (j & 3));
+    }
+    *reinterpret_cast<uint2*>(dst + r * (K / 2) + g * 8) = make_uint2(w[0], w[1]);
+    dst[scale_offset(rows, K) + scale_index(r, g, K)] = (uint8_t) sb;
+}
+
+__global__ void f8_amax_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scale,
+                               const float* __restrict__ row_scales, int64_t rows, int64_t K, unsigned* __restrict__ amax) {
+    const int64_t ng = K / 16;
+    const int64_t total = rows * ng;
+    const float tsc = scale ? *scale : 1.0f;
+    float m = 0.0f;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t r = i / ng;
+        const float rsc = fabsf(row_scales ? row_scales[r] : tsc);
+        const uint4 raw = reinterpret_cast<const uint4*>(codes)[i];
+        const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
+        float gm = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t b = (uint8_t) ((words[j >> 2] >> (8 * (j & 3))) & 0xffu);
+            gm = fmaxf(gm, fabsf(__half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) b, __NV_E4M3)))));
+        }
+        m = fmaxf(m, gm * rsc);
+    }
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if ((threadIdx.x & 31) == 0) atomicMax(amax, __float_as_uint(m));
+}
+
+__global__ void f8_to_planes_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ in_scale,
+                                    const float* __restrict__ row_scales, int64_t rows, int64_t K,
+                                    const float* __restrict__ out_scale, uint8_t* __restrict__ dst) {
+    const int64_t ng = K / 16;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * ng) return;
+    const int64_t r = i / ng, g = i - r * ng;
+    const float gs = *out_scale;
+    const float rsc = row_scales ? row_scales[r] : (in_scale ? *in_scale : 1.0f);
+    const uint4 raw = reinterpret_cast<const uint4*>(codes)[i];
+    const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
+    float v[16], m = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const uint8_t b = (uint8_t) ((words[j >> 2] >> (8 * (j & 3))) & 0xffu);
+        v[j] = __half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) b, __NV_E4M3))) * rsc;
+        m = fmaxf(m, fabsf(v[j]));
+    }
+    const __nv_fp8_storage_t sb = __nv_cvt_float_to_fp8(m / (6.0f * gs), __NV_SATFINITE, __NV_E4M3);
+    const float sd = __half2float(__half(__nv_cvt_fp8_to_halfraw(sb, __NV_E4M3)));
+    const float inv = sd > 0.0f ? 1.0f / (sd * gs) : 0.0f;
+    uint32_t w[2] = {0, 0};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t c = e2m1_code(v[2 * j] * inv) | (e2m1_code(v[2 * j + 1] * inv) << 4);
         w[j >> 2] |= c << (8 * (j & 3));
     }
     *reinterpret_cast<uint2*>(dst + r * (K / 2) + g * 8) = make_uint2(w[0], w[1]);
@@ -157,6 +212,27 @@ void from_q8(const void* q8_blocks, int64_t rows, int64_t K, void* planes, float
     q8_gs_kernel<<<1, 1, 0, s>>>(amax, scale);
     const int64_t n = rows * (K / 16);
     q8_to_planes_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>((const uint8_t*) q8_blocks, rows, K, scale, (uint8_t*) planes);
+}
+
+void from_f8(const void* f8_codes, const float* scale, const float* row_scales, int64_t rows, int64_t K, void* planes,
+             float* out_scale, void* stream) {
+    if (!fits(rows, K)) {
+        basalt::log::error("basalt", "nvfp4p::from_f8: %lld x %lld", (long long) rows, (long long) K);
+        std::exit(1);
+    }
+    const cudaStream_t s = (cudaStream_t) stream;
+    unsigned* amax = reinterpret_cast<unsigned*>(out_scale);
+    cudaMemsetAsync(amax, 0, sizeof(unsigned), s);
+    f8_amax_kernel<<<1024, 256, 0, s>>>((const uint8_t*) f8_codes, scale, row_scales, rows, K, amax);
+    q8_gs_kernel<<<1, 1, 0, s>>>(amax, out_scale);
+    const int64_t n = rows * (K / 16);
+    f8_to_planes_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>((const uint8_t*) f8_codes, scale, row_scales, rows, K,
+                                                                     out_scale, (uint8_t*) planes);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        basalt::log::error("basalt", "nvfp4p::from_f8: %s", cudaGetErrorString(e));
+        std::exit(1);
+    }
 }
 
 }  // namespace basalt::kernels::nvfp4p

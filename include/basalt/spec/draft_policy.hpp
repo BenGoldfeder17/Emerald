@@ -37,7 +37,8 @@ public:
 
     /// `timed` false: round times are not read, every round costs the prior shape of its size, so the picks follow the
     /// drafts' outcomes alone (the same tokens give the same windows on every run).
-    explicit DraftPolicy(int max_t, double margin = 0.03, bool timed = true);
+    /// `flat_cost` true: dense GPU-resident prior where rows within a tile cost nearly the same (unlike offloaded MoE).
+    explicit DraftPolicy(int max_t, double margin = 0.03, bool timed = true, bool flat_cost = false);
 
     struct Pick {
         bool lookup = false;
@@ -66,6 +67,7 @@ private:
     static int chance_bin(float chance);
     bool unmeasured(int t) const;          // a size measured too few times, or too long ago, to trust its cost
     bool recent(int t) const;              // measured within the last rounds
+    const double* shape() const;
     double base(int t) const;              // a size's cost relative to the scale, measured or inferred
     double base_from(int t, bool lately) const;   // t's base from the other (recent) sizes; < 0 without any
     double mtp_tokens(int t) const;
@@ -75,6 +77,7 @@ private:
     int max_t_;
     double margin_;
     bool timed_;
+    bool flat_cost_;
     double scale_ = 0.0;                                   // round ms = scale x base(size)
     std::array<double, kMaxT + 1> base_{}, base_n_{};      // by window size; rounds behind it
     std::array<long, kMaxT + 1> seen_{};                   // the round each size was last measured

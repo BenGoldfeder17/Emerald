@@ -194,6 +194,8 @@ Plan plan_for(const Call& c) {
         return p;
     }
     const int64_t R = resident(*p.k);
+    const int64_t S = sm_count();
+    const int64_t per_sm = std::max<int64_t>(1, R / S);
     const int cb = c.fmt == Format::Q8 ? p.k->ch : c.fmt == Format::Bf16 ? 2 * p.k->ch : p.k->ch / 2;   // weight bytes per row per chunk
     const double sums = 1.0 + 64.0 / cb;   // an item's fixed cost in chunks: its pipeline turn and its slice's sums
     double best = 1e30;
@@ -204,7 +206,10 @@ Plan plan_for(const Call& c) {
         // plus the tile's last block's walk over the slices' sums, about a quarter chunk a slice at 16 rows (40 slices
         // of a 256-row matrix cost 15.7 us at T = 16 against 7.7 at 10)
         const double tail = kse > 1 ? 0.25 * kse : 0.0;
-        const double cost = (double) ((items + R - 1) / R) * (cps + (kse > 1 ? sums : 0.0)) + tail;
+        // busiest SM runs ceil(items / S) blocks (more accurate than rounding up to whole R-block waves when tiles
+        // land between S and R, e.g. 80 tiles on 48 SMs where 32 SMs take 2 blocks and 16 take 1)
+        const double waves = (double) ((items + S - 1) / S) / (double) per_sm;
+        const double cost = waves * (cps + (kse > 1 ? sums : 0.0)) + tail;
         if (cost < best - 1e-9) {
             best = cost;
             p.ks = kse;
@@ -290,7 +295,8 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
     if (p.ks > 1 && ((size_t) p.ks * kRows * pr > ws.partial_floats || (size_t) p.tiles > ws.tickets_n))
         refuse("workspace too small", c);
     const Kernel& k = kernel_for(c, T > 24 ? 4 : T > 16 ? 3 : T > 8 ? 2 : 1);   // 8-column tiles; a row's sums are the same in any
-    resident(k);   // its smem allowance
+    const int rk = resident(k);   // its smem allowance and residency (grid matches k without changing ks)
+    const int grid = c.fmt == Format::F8 ? p.grid : (int) std::min<int64_t>((int64_t) p.tiles * p.ks, rk);
     Args a{};
     int t0 = 0;
     int64_t off = 0;
@@ -322,7 +328,7 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
     a.act_out = (uint16_t*) c.act_out;
     a.partial = ws.partial;
     a.tickets = ws.tickets;
-    launch_pdl(k.fn, dim3((unsigned) p.grid), dim3((unsigned) k.threads), (size_t) k.smem,
+    launch_pdl(k.fn, dim3((unsigned) grid), dim3((unsigned) k.threads), (size_t) k.smem,
                (cudaStream_t) stream, a);
     check("window gemm");
 }

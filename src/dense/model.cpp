@@ -218,37 +218,77 @@ bool decode_drafter(Model& m, std::string& err) {
         l.type = kTypeNvfp4Planes;
         return true;
     };
+    auto copy_fp4 = [&](Linear& l) -> bool {
+        if (!q8(l) || !kernels::nvfp4p::fits(l.rows, l.cols)) return copy(l);
+        void* p = nullptr;
+        void* sc = nullptr;
+        if (cudaMalloc(&p, kernels::nvfp4p::bytes(l.rows, l.cols)) != cudaSuccess ||
+            cudaMalloc(&sc, 16) != cudaSuccess) {
+            if (p) cudaFree(p);
+            if (sc) cudaFree(sc);
+            return false;
+        }
+        m.owned.push_back(p);
+        m.owned.push_back(sc);
+        const void* w = l.w;
+        const int rows = l.rows, cols = l.cols;
+        steps.push_back([=](void*) {
+            kernels::nvfp4p::from_q8(w, rows, cols, p, (float*) sc, nullptr);
+            return true;
+        });
+        l.w = p;
+        l.scale = (const float*) sc;
+        l.type = kTypeNvfp4Planes;
+        return true;
+    };
     bool ok = true;
     for (BlockDrafter::Layer& D : bd.layers) {
         for (Linear* l : {&D.gate, &D.up, &D.down, &D.q, &D.o}) ok = ok && to_fp4(*l);
         for (Linear* l : {&D.conv_a, &D.conv_f}) ok = ok && in_place(*l);
         if (kernels::nvfp4p::fits(D.k.rows, D.k.cols) && kernels::nvfp4p::fits(D.v.rows, D.v.cols)) {
             // k and v as NVFP4 copies (prompt chunks read their blocks), so q, k and v stay one call
-            for (Linear* l : {&D.k, &D.v}) {
-                void* p = nullptr;
-                void* sc = nullptr;
-                if (!q8(*l) || cudaMalloc(&p, kernels::nvfp4p::bytes(l->rows, l->cols)) != cudaSuccess ||
-                    cudaMalloc(&sc, 16) != cudaSuccess) {
-                    ok = false;
-                    break;
-                }
-                m.owned.push_back(p);
-                m.owned.push_back(sc);
-                const void* w = l->w;
-                const int rows = l->rows, cols = l->cols;
-                steps.push_back([=](void*) {
-                    kernels::nvfp4p::from_q8(w, rows, cols, p, (float*) sc, nullptr);
-                    return true;
-                });
-                l->w = p;
-                l->scale = (const float*) sc;
-                l->type = kTypeNvfp4Planes;
-            }
+            for (Linear* l : {&D.k, &D.v}) ok = ok && copy_fp4(*l);
         } else {
             ok = ok && copy(D.k) && copy(D.v);
         }
     }
-    for (Linear& l : bd.fc) ok = ok && copy(l);
+    // fc as NVFP4 copies (prompt chunks still read Q8_0 blocks): halves the bytes read on every target verify window
+    for (Linear& l : bd.fc) ok = ok && copy_fp4(l);
+    // optional NVFP4 copy of the FP8 LM head's leading kDraftVocab rows for the drafter pass alone (the target model
+    // always verifies against the exact FP8 m.w.head); skipped cleanly if VRAM headroom above the sessions is tight
+    if (ok && m.w.head.type == kTypeF8) {
+        const int64_t nv = m.w.head.rows > kDraftVocab ? kDraftVocab : m.w.head.rows;
+        if (kernels::nvfp4p::fits(nv, m.w.head.cols)) {
+            const size_t hb = kernels::nvfp4p::bytes(nv, m.w.head.cols);
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            const uint64_t sess_b =
+                (uint64_t) std::max(m.o.sessions, 1) *
+                (session_bytes(m.g, m.o.max_context, false, m.o.kv_int8, m.o.kv_resident, m.lb, m.le) +
+                 block_session_bytes(m.g, m.w.dflash));
+            if (free_b > sess_b + hb + (1024ull << 20)) {
+                void* p = nullptr;
+                void* sc = nullptr;
+                if (cudaMalloc(&p, hb) == cudaSuccess && cudaMalloc(&sc, 16) == cudaSuccess) {
+                    m.owned.push_back(p);
+                    m.owned.push_back(sc);
+                    const void* hw = m.w.head.w;
+                    const float* hsc = m.w.head.scale;
+                    const float* hrsc = m.w.head.row_scales;
+                    const int64_t cols = m.w.head.cols;
+                    steps.push_back([=](void*) {
+                        kernels::nvfp4p::from_f8(hw, hsc, hrsc, nv, cols, p, (float*) sc, nullptr);
+                        return true;
+                    });
+                    bd.draft_head = {kTypeNvfp4Planes, p, nv, cols, (const float*) sc, nullptr};
+                } else {
+                    if (p) cudaFree(p);
+                    if (sc) cudaFree(sc);
+                    (void) cudaGetLastError();
+                }
+            }
+        }
+    }
     if (!ok) {
         err = m.o.arch + ": laying out the block drafter for decode windows failed";
         return false;
@@ -279,6 +319,7 @@ bool decode_drafter(Model& m, std::string& err) {
         need({&D.gate, &D.up});
     }
     for (const Linear& l : bd.fc) need({&l});
+    if (bd.draft_head.w) need({&bd.draft_head});
     if (need_p > m.ws.w8.partial_floats || need_t > m.ws.w8.tickets_n) {
         void *p = nullptr, *t = nullptr;
         if (cudaMalloc(&p, std::max<size_t>(need_p, 1) * 4) != cudaSuccess || cudaMalloc(&t, need_t * 4) != cudaSuccess ||
