@@ -454,6 +454,8 @@ int main() {
             const size_t cache_cells = 128;
             const size_t ce = cache_cells * NKV * hd;
             for (const bool i8 : {false, true}) {
+                const std::vector<int32_t> c0_h = {(int32_t) c0[0], (int32_t) c0[1], (int32_t) c0[2]};
+                int32_t* dc0 = up(c0_h);
                 uint16_t *kr[3] = {}, *vr[3] = {}, *ks[3] = {}, *vs[3] = {};
                 basalt::kernels::KvInt8 q8r[3] = {}, q8s[3] = {};
                 basalt::kernels::QkPrepSeg segs[3] = {};
@@ -479,7 +481,8 @@ int main() {
                                                      dpos + (size_t) row * 3, lens[i], NH, NKV,
                                                      qo_ref + (size_t) row * NH * hd, kr[i], vr[i], c0[i], S, hd, gated, cap,
                                                      nullptr, q8r[i]);
-                    segs[i] = {lens[i], ks[i], vs[i], c0[i], cap, nullptr, q8s[i], {}};
+                    // Exercise both host cell0 (segment 0) and device-read cell0_dev (segments 1 and 2)
+                    segs[i] = {lens[i], ks[i], vs[i], i == 0 ? c0[i] : 0, cap, i == 0 ? nullptr : dc0 + i, q8s[i], {}};
                     row += lens[i];
                 }
                 basalt::kernels::attn_qk_prepare_segs(dqf, dk, dv, dqn, dkn, 1e-6f, rope, dpos, segs, 3, NH, NKV, qo_seg, S, hd, gated);
@@ -499,7 +502,8 @@ int main() {
                         cudaFree(q8s[i].k); cudaFree(q8s[i].v); cudaFree(q8s[i].ks); cudaFree(q8s[i].vs);
                     }
                 }
-                std::printf("attn_qk_prepare_segs hd=%d %s bitwise diffs: %d%s\n", hd, i8 ? "int8" : "fp16", diff, diff ? "  FAIL" : "");
+                cudaFree(dc0);
+                std::printf("attn_qk_prepare_segs (host+dev cell0) hd=%d %s bitwise diffs: %d%s\n", hd, i8 ? "int8" : "fp16", diff, diff ? "  FAIL" : "");
                 if (diff) ++fails;
             }
             cudaFree(dqf); cudaFree(dk); cudaFree(dv); cudaFree(dqn); cudaFree(dkn); cudaFree(dpos); cudaFree(qo_ref); cudaFree(qo_seg);

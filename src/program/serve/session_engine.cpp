@@ -315,7 +315,12 @@ public:
             err = r.message;
             return false;
         }
-        c.state_a.resize(rs.bytes());
+        try {
+            c.state_a.resize(rs.bytes());
+        } catch (const std::bad_alloc&) {
+            basalt::log::warn("basalt serve", "checkpoint skipped at %lld: out of host memory", (long long) to);
+            return true;
+        }
         std::memcpy(c.state_a.data(), rs.head.data(), rs.head.size());
         // the state is snapshotted on the device now and moves to the host while the request goes on (each card's part on
         // its own device)
@@ -335,7 +340,11 @@ public:
     basalt::model::Result save_running_now(basalt::core::CheckpointBytes& to, int64_t pos) {
         basalt::core::RunningState rs;
         if (const basalt::model::Result r = session().running_state(pos, true, rs); !r.ok()) return r;
-        to.resize(rs.bytes());
+        try {
+            to.resize(rs.bytes());
+        } catch (const std::bad_alloc&) {
+            return {basalt::model::Status::Error, "out of host memory for running state"};
+        }
         std::memcpy(to.data(), rs.head.data(), rs.head.size());
         std::string e;
         if (!basalt::core::running_copy_out(rs, to.data(), e)) return {basalt::model::Status::Error, e};

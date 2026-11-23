@@ -160,6 +160,7 @@ public:
     uint64_t draft_clock = 0;
     std::vector<BatchGraph> ctx_graphs;
     uint64_t ctx_clock = 0;
+    uint64_t hl_gen = 0;   // bumped whenever ws.hl is overwritten (guards cross-slot last_logits_ reads)
     int rec_pending = 0;   // sessions with uncommitted GDN rows currently occupying ws.rec_*
     // a batch window's GDN gates run on gate_side beside the qkv/z product, from gate_fork to gate_join
     cudaStream_t gate_side = nullptr;

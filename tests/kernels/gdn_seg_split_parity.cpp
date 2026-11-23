@@ -217,6 +217,30 @@ int main() {
         }
         std::printf("h_kv_only + shared commit (4 segs): %s\n", ok ? "bitwise" : "FAIL");
         if (!ok) ++fails;
+        // Solo dec_gdn_rec (cluster kernel) with h_kv_only=true vs false + gdn_commit_layers
+        {
+            const int solo_T = 5, solo_keep = 4;
+            float *s_ref = up(st0[0]), *s_kv = up(st0[0]);
+            DecRecArgs s0 = a0, s1 = a1;
+            s0.state = s_ref; s1.state = s_kv;
+            s0.y = o_ref; s1.y = o_kv;
+            cudaMemsetAsync(y16_ref, 0, (size_t) solo_T * VD * 2, S0);
+            cudaMemsetAsync(y16_kv,  0, (size_t) solo_T * VD * 2, S0);
+            dec_gdn_rec(s0, solo_T, S0);
+            dec_gdn_rec(s1, solo_T, S0);
+            bool sok = same("solo h_kv_only y16", y16_ref, y16_kv, (size_t) solo_T * VD * 2);
+            cudaMemcpyAsync(d_keep, &solo_keep, 4, cudaMemcpyHostToDevice, S0);
+            GdnCommitLayers sc0{s_ref, h_ref, dqkv, g_ref, b_ref, sf, (size_t) rows * C, (size_t) rows * g.h_v,
+                                (size_t) rows * C, C, g.h_k, g.h_v, 1, d_keep, false};
+            GdnCommitLayers sc1{s_kv, h_kv, dqkv, g_kv, b_kv, sf, (size_t) rows * HKV, (size_t) rows * g.h_v,
+                                (size_t) rows * C, C, g.h_k, g.h_v, 1, d_keep, true};
+            gdn_commit_layers(sc0, S0, 32, solo_keep);
+            gdn_commit_layers(sc1, S0, 32, solo_keep);
+            sok = same("solo h_kv_only commit state", s_ref, s_kv, sf * 4) && sok;
+            std::printf("h_kv_only + solo dec_gdn_rec + commit: %s\n", sok ? "bitwise" : "FAIL");
+            if (!sok) ++fails;
+            cudaFree(s_ref); cudaFree(s_kv);
+        }
         cudaFree(d_keep);
         for (float* p : st_ref) cudaFree(p);
         for (float* p : st_kv) cudaFree(p);

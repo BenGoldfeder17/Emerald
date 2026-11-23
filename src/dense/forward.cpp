@@ -1014,24 +1014,43 @@ void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size
 }
 
 void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64_t pos) {
-    const bool fp4_kv = m.bd_dec.present && !m.bd_dec.layers.empty() &&
-                        m.bd_dec.layers[0].k.type == kTypeNvfp4Planes && m.bd_dec.layers[0].v.type == kTypeNvfp4Planes;
-    const BlockDrafter& bd = fp4_kv ? m.bd_dec : m.w.dflash;
+    if (n <= 0 || m.w.dflash.layers.empty()) return;
+    // The drafter context ring holds at most dctx_cap cells: skip older rows of a chunk longer than the ring so one
+    // launch never aliases two rows onto the same cell (and skips wasted K/V work for rows that would be overwritten).
+    const int skip = n > (int) st.dctx_cap ? n - (int) st.dctx_cap : 0;
+    dacc += (size_t) skip * (size_t) m.g.n_embd;
+    n -= skip;
+    pos += skip;
+    const BlockDrafter& bd = m.bd_dec.present ? m.bd_dec : m.w.dflash;
+    bool any_fp4 = false, any_other = false;
+    int other_type = 0;
+    for (size_t l = 0; l < bd.layers.size(); ++l) {
+        const BlockDrafter::Layer& D =
+            m.bd_dec.present && m.bd_dec.layers[l].k.type == kTypeNvfp4Planes && m.bd_dec.layers[l].v.type == kTypeNvfp4Planes
+                ? m.bd_dec.layers[l]
+                : m.w.dflash.layers[l];
+        if (D.k.type == kTypeNvfp4Planes && D.v.type == kTypeNvfp4Planes) any_fp4 = true;
+        else { any_other = true; other_type = D.k.type; }
+    }
     ChunkScratch& b = m.cs;
     const cudaStream_t s = st.stream;
     const int H = m.g.n_embd;
-    if (fp4_kv) {
+    if (any_fp4 && !any_other) {
         prefill::fp4_dense::rms_norm_quantize(dacc, bd.hidden_norm, bd.eps, n, H, b.a4, b.gs, nullptr, s);
     } else {
         kernels::rms_norm_rows(dacc, bd.hidden_norm, b.xn, n, H, bd.eps, s);
-        chunk_act(m, b.xn, bd.layers[0].k.type, H, n, s);
+        if (any_fp4) prefill::fp4_dense::quantize(b.xn, n, H, H, b.a4, b.gs, s);
+        if (any_other) chunk_act(m, b.xn, other_type, H, n, s);
     }
     std::vector<int32_t> p3;
     text_positions(p3, n, pos, 0);
     cudaMemcpyAsync(b.pos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     kernels::RopeSpec rope = block_rope(bd);
     for (size_t l = 0; l < bd.layers.size(); ++l) {
-        const BlockDrafter::Layer& D = bd.layers[l];
+        const BlockDrafter::Layer& D =
+            m.bd_dec.present && m.bd_dec.layers[l].k.type == kTypeNvfp4Planes && m.bd_dec.layers[l].v.type == kTypeNvfp4Planes
+                ? m.bd_dec.layers[l]
+                : m.w.dflash.layers[l];
         gemm(m, D.k, b.dk, n, s);
         gemm(m, D.v, b.dv, n, s);
         kernels::attn_qk_prepare(nullptr, b.dk, b.dv, nullptr, D.k_norm, bd.eps, rope, b.pos, n, 0, bd.n_kv, nullptr,
@@ -1131,6 +1150,13 @@ bool block_ctx_batch(Model& m, const BlockCtxSeg* segs, int S, std::string& err,
                                           nullptr, s, bd.head_dim, false);
         }
     };
+
+    // Only graph solo (S == 1, <= 16 keys) context updates; at S >= 2, per-slot accepted-row counts yield up to
+    // 8^S compositions that thrash the 64-entry cache and pay capture+instantiate overhead on almost every round.
+    if (S > 1) {
+        ctx_body();
+        return cuda_ok("block drafter context", err);
+    }
 
     bool skip_capture = false;
     for (Model::BatchGraph& bg : m.ctx_graphs) {

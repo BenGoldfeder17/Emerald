@@ -44,8 +44,9 @@ bool running_copy_in(const RunningState& rs, const uint8_t* host, std::string& e
 /// speed, ordered after the stream's earlier work and before its later work, so decode may change the live state at
 /// once; the spare then moves to the host on a side stream while the caller carries on.  Nothing may read, move-from or
 /// free the segments' host bytes before finish() has returned true.  One save is in flight at a time: save() finishes the
-/// previous one.  Host bytes that are not page-locked (a few KiB of small parts) go through a bounce buffer and are copied
-/// on by finish(); a save with more of them than the bounce buffer holds is made at once.
+/// previous one.  Host bytes that are not page-locked go through a reusable pinned bounce buffer (sized to the reserved
+/// checkpoint when host memory permits) and are copied on by finish(); a save with more unpinned bytes than the bounce
+/// buffer holds falls back to copying out at once.
 class CheckpointDeferral {
 public:
     static constexpr size_t kBounceBytes = size_t(1) << 20;
@@ -57,6 +58,7 @@ public:
     /// once.  Regions saved afterwards must lie on this device.
     bool reserve(size_t bytes, std::string& error);
     size_t capacity() const { return cap_; }
+    size_t bounce_capacity() const { return bounce_cap_; }
     /// `key` names the save in flight (pending()): the address of the checkpoint's bytes.
     bool save(const std::vector<SaveSegment>& segments, cudaStream_t stream, const void* key, std::string& error);
     /// The key of the save still in flight (null: none).
@@ -74,6 +76,7 @@ private:
     uint8_t* spare_ = nullptr;
     uint8_t* bounce_ = nullptr;
     size_t cap_ = 0;
+    size_t bounce_cap_ = 0;
     cudaStream_t stream_ = nullptr;
     cudaEvent_t snapshot_ = nullptr, landed_ = nullptr;
     std::vector<Bounced> tail_;

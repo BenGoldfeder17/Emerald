@@ -127,11 +127,10 @@ int main() {
         size_t head_bytes = 0;
         for (const DeviceRegion& x : head) head_bytes += x.bytes;
         std::vector<uint8_t> loose(total - head_bytes);   // not page-locked
-        check(loose.size() > CheckpointDeferral::kBounceBytes || true, "setup");
-        const bool fits = loose.size() <= CheckpointDeferral::kBounceBytes;
+        const bool fits = loose.size() <= deferral.bounce_capacity();
         check(deferral.save({{b.data(), head}, {loose.data(), tail}}, work, b.data(), err), "save to a locked and an ordinary segment");
         check(fits ? deferral.pending() == b.data() : deferral.pending() == nullptr,
-              "ordinary bytes beyond the bounce buffer are saved at once");
+              "ordinary bytes within bounce_capacity() defer; beyond it save at once");
         check(deferral.finish(err), "finish");
         check(std::equal(b.begin(), b.begin() + (std::ptrdiff_t) head_bytes, original.begin()) &&
               std::equal(loose.begin(), loose.end(), original.begin() + (std::ptrdiff_t) head_bytes),

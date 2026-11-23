@@ -23,8 +23,8 @@ namespace basalt::kernels {
 constexpr int kGqaMaxWindow = 32;
 constexpr int kGqaChunk = 32;   // cells per decode/window attention chunk
 
-/// An int8 K/V cache in place of the fp16 one: codes [cell][n_kv][256], fp16 scales [cell][n_kv][4] (one per 64 values,
-/// amax / 127, codes rounded to nearest).  `k` null: the fp16 cache.
+/// An int8 K/V cache in place of the fp16 one: codes [cell][n_kv][head_dim], fp16 scales [cell][n_kv][head_dim / 64]
+/// (one per 64 values, amax / 127, codes rounded to nearest).  `k` null: the fp16 cache.
 struct KvInt8 {
     int8_t* k = nullptr;
     int8_t* v = nullptr;

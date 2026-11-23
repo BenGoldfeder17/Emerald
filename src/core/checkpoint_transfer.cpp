@@ -4,6 +4,7 @@
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/ram_load.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace basalt::core {
@@ -101,6 +102,7 @@ void CheckpointDeferral::release() {
     stream_ = nullptr;
     snapshot_ = landed_ = nullptr;
     cap_ = 0;
+    bounce_cap_ = 0;
     dst_ = nullptr;
     tail_.clear();
 }
@@ -117,13 +119,27 @@ bool CheckpointDeferral::reserve(size_t bytes, std::string& error) {
         error = "cannot create the deferred checkpoint stream";
         return false;
     }
-    if (cudaMalloc((void**) &spare_, bytes) != cudaSuccess || cudaHostAlloc((void**) &bounce_, kBounceBytes, cudaHostAllocPortable) != cudaSuccess) {
+    if (cudaMalloc((void**) &spare_, bytes) != cudaSuccess) {
         cudaGetLastError();
         release();
         error = "cannot allocate the deferred checkpoint buffer";
         return false;
     }
+    // Size the single reusable pinned bounce buffer to the checkpoint so lazy pageable blocks beyond the hot pinned
+    // pool still save asynchronously without stalling the request path (fall back to kBounceBytes if tight on host RAM).
+    size_t bcap = std::max(bytes, kBounceBytes);
+    if (cudaHostAlloc((void**) &bounce_, bcap, cudaHostAllocPortable) != cudaSuccess) {
+        cudaGetLastError();
+        bcap = kBounceBytes;
+        if (cudaHostAlloc((void**) &bounce_, bcap, cudaHostAllocPortable) != cudaSuccess) {
+            cudaGetLastError();
+            release();
+            error = "cannot allocate the deferred checkpoint bounce buffer";
+            return false;
+        }
+    }
     cap_ = bytes;
+    bounce_cap_ = bcap;
     return true;
 }
 
@@ -137,7 +153,7 @@ bool CheckpointDeferral::save(const std::vector<SaveSegment>& segments, cudaStre
     }
     // host bytes the driver would stage itself make the copy wait for the host: more than the bounce buffer holds, and
     // the save is made at once instead
-    if (!spare_ || total > cap_ || !total || loose > kBounceBytes) return checkpoint_copy_out(segments, stream, error);
+    if (!spare_ || total > cap_ || !total || loose > bounce_cap_) return checkpoint_copy_out(segments, stream, error);
     // snapshot: every region into the spare, in the stream's order, so work queued after this call cannot change it
     size_t at = 0;
     for (const SaveSegment& s : segments)

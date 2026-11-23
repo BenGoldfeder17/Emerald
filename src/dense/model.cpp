@@ -310,16 +310,23 @@ bool decode_drafter(Model& m, std::string& err) {
         return q8(l) && kernels::nvfp4p::fits(l.rows, l.cols) ? to_fp4(l) : copy(l);
     };
     bool ok = true;
-    for (BlockDrafter::Layer& D : bd.layers) {
-        for (Linear* l : {&D.gate, &D.up, &D.down, &D.q, &D.o}) ok = ok && to_fp4(*l);
-        for (Linear* l : {&D.conv_a, &D.conv_f}) ok = ok && in_place(*l);
+    for (size_t l = 0; l < bd.layers.size(); ++l) {
+        BlockDrafter::Layer& D = bd.layers[l];
+        BlockDrafter::Layer& W = m.w.dflash.layers[l];
+        for (Linear* lin : {&D.gate, &D.up, &D.down, &D.q, &D.o}) ok = ok && to_fp4(*lin);
+        for (Linear* lin : {&D.conv_a, &D.conv_f}) ok = ok && in_place(*lin);
         if (q8(D.k) && q8(D.v) && kernels::nvfp4p::fits(D.k.rows, D.k.cols) && kernels::nvfp4p::fits(D.v.rows, D.v.cols)) {
-            for (Linear* l : {&D.k, &D.v}) ok = ok && to_fp4(*l);
+            ok = ok && to_fp4(D.k) && to_fp4(D.v);
+            if (ok) { W.k = D.k; W.v = D.v; }   // keep w.dflash metadata truthful after in-place conversion
         } else {
             ok = ok && copy(D.k) && copy(D.v);
         }
     }
-    for (Linear& l : bd.fc) ok = ok && to_fp4_shared(l);
+    for (size_t j = 0; j < bd.fc.size(); ++j) {
+        const bool in_pl = q8(bd.fc[j]) && kernels::nvfp4p::fits(bd.fc[j].rows, bd.fc[j].cols);
+        ok = ok && to_fp4_shared(bd.fc[j]);
+        if (ok && in_pl) m.w.dflash.fc[j] = bd.fc[j];   // keep w.dflash metadata truthful after in-place conversion
+    }
     // optional NVFP4 copy of the FP8 LM head's leading kDraftVocab rows for the drafter pass alone (the target model
     // always verifies against the exact FP8 m.w.head); accounts for sessions, lazy prompt scratch and --vram-reserve-mib
     if (ok && m.w.head.type == kTypeF8) {

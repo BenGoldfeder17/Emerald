@@ -130,7 +130,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
             q.v = st.arena.take<int8_t>(dcells);
             q.ks = st.arena.take<uint16_t>(dcells / 64);
             q.vs = st.arena.take<uint16_t>(dcells / 64);
-            if (!q.vs) {
+            if (!q.k || !q.v || !q.ks || !q.vs) {
                 err = m.o.arch + ": the block drafter's context ring does not fit the session's arena";
                 return false;
             }
@@ -219,6 +219,7 @@ public:
     // The drafter's chain after `anchor` (the token at `pos`): step 0 pairs main's last normed row (cell pos - 1) with
     // the anchor, each later step its own output with the draft before it; all on the stream, read by draft_end.
     Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        ++m_.hl_gen;
         last_logits_ = nullptr;   // block_draft / mtp_window will reuse m_.ws.hl
         if (block_) {
             // the GDN commit runs beside the drafter (which reads none of its rows); the stream waits for it after
@@ -266,11 +267,12 @@ public:
     Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
                        int count) override {
         if (count <= 1 || !block_ || 2 * m_.w.dflash.block > kBatch) return ModelSession::draft_batch(peers, anchors, pos, n, count);
+        ++m_.hl_gen;   // block_draft_batch below will reuse m_.ws.hl (invalidates every session's last_logits_)
         std::vector<Session*> ss((size_t) count);
         for (int i = 0; i < count; ++i) {
             ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
             if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return fail(m_.o.arch + ": a draft batch of sessions of another model");
-            ss[(size_t) i]->last_logits_ = nullptr;   // block_draft_batch below will reuse m_.ws.hl
+            ss[(size_t) i]->last_logits_ = nullptr;
         }
         const cudaStream_t s0 = ss[0]->st_.stream;
         for (int i = 1; i < count; ++i) {
@@ -408,6 +410,7 @@ public:
         if (!prepare_draw(r, err)) return fail(err);
         if (drafter_) cudaMemcpyAsync(st_.win_tok, r.tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, st_.stream);
         if (!forward_window(m_, st_, r.tokens, T, r.pos, pos3, err)) return fail(err);
+        last_logits_gen_ = ++m_.hl_gen;
         last_logits_ = m_.ws.hl;
         draw(T);
         set_pending(r.pos, T);
@@ -482,12 +485,14 @@ public:
         if (!forward_batch(m_, segs.data(), n, tokens.data(), pos3.data(), err)) return fail(err);
         // batch logits stay in m_.ws.hl (skipping up to 64 MB of D2D copies per round); every consumer
         // (draw, r.logits, resample_row, row_logprobs) runs before the next draft_batch or decode_batch touches b.hl
+        const uint64_t hl_gen = ++m_.hl_gen;
         int row_off = 0;
         for (int i = 0; i < n; ++i) {
             Session& se = *ss[(size_t) i];
             const model::DecodeRequest& r = reqs[i];
             const int T = r.n_tokens;
             se.last_logits_ = m_.ws.hl + (size_t) row_off * g_.n_vocab;
+            se.last_logits_gen_ = hl_gen;
             row_off += T;
             se.draw(T, s);
             se.set_pending(r.pos, T);
@@ -505,6 +510,7 @@ public:
     }
 
     Result prefill_chunk(const model::PrefillRequest& r) override {
+        if (r.n_tokens <= 0) return r.pos == 0 ? settle(0) : flush_pending(r.pos);
         if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the prompt passes the context");
         if (Result s = settle(r.pos); !s.ok()) return s;
         if (m_.split && !drafter_) {   // the layer split: the chunks pipelined over the two cards
@@ -592,7 +598,7 @@ public:
 
     // The running state for the shared checkpoint transfer: the head {rope_delta, pos, tail_cell, valid} on the host,
     // then the regions the engine moves itself: the GDN state, the drafter's waiting row, and the block drafter's
-    // context rings per layer (K, V) whole as they lie. A ring holds cell c at slot c % capacity, so a restore at the
+    // context rings per layer (INT8 K/V codes and FP16 scales) whole as they lie. A ring holds cell c at slot c % capacity, so a restore at the
     // same position finds every cell where it was; `valid` says how many cells below the position are this
     // conversation's.
     static constexpr size_t kHeadBytes = 4 * sizeof(int64_t);
@@ -1070,7 +1076,7 @@ private:
         if (pend_T_ > 0) --m_.rec_pending;
         pend_T_ = 0;
     }
-    const float* logits_ptr() const { return last_logits_; }
+    const float* logits_ptr() const { return (last_logits_ && last_logits_gen_ == m_.hl_gen) ? last_logits_ : nullptr; }
     void draw(int T) { draw(T, st_.stream); }
     void draw(int T, cudaStream_t stream) {
         kernels::sample_tokens(logits_ptr(), T, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_,
@@ -1086,6 +1092,7 @@ private:
     const Geometry& g_;
     SessionState st_;
     const float* last_logits_ = nullptr;
+    uint64_t last_logits_gen_ = 0;
     int32_t* h_picks_ = nullptr;
     int32_t* h_dids_ = nullptr;
     float* h_dconf_ = nullptr;
