@@ -273,18 +273,27 @@ public:
             cudaEventRecord(ss[(size_t) i]->sync_ev_, ss[(size_t) i]->st_.stream);
             cudaStreamWaitEvent(s0, ss[(size_t) i]->sync_ev_, 0);
         }
+        std::vector<BlockCtxSeg> ctx_segs;
+        ctx_segs.reserve((size_t) count);
         for (int i = 0; i < count; ++i)
-            if (Result r = ss[(size_t) i]->settle(pos[i], true, s0); !r.ok()) return r;   // commits on side streams, ctx on s0
+            if (Result r = ss[(size_t) i]->settle(pos[i], true, s0, &ctx_segs); !r.ok()) return r;   // commits on side streams
+        std::string err;
+        for (size_t ci = 0; ci < ctx_segs.size();) {
+            int ck = 0, crows = 0;
+            while (ci + (size_t) ck < ctx_segs.size() && crows + ctx_segs[ci + (size_t) ck].n <= kBatch)
+                crows += ctx_segs[ci + (size_t) ck++].n;
+            if (!block_ctx_batch(m_, ctx_segs.data() + ci, ck, err, s0)) return fail(err);
+            ci += (size_t) ck;
+        }
         if (!done_ && cudaEventCreateWithFlags(&done_, cudaEventDisableTiming) != cudaSuccess) return fail(m_.o.arch + ": no event");
         std::vector<SessionState*> sts((size_t) count);
         for (int i = 0; i < count; ++i) sts[(size_t) i] = &ss[(size_t) i]->st_;
-        std::string err;
         // the blocks in passes of at most a batch window's rows, in order
         std::vector<int> nn((size_t) count), width((size_t) count);
         // a slot's next window shares the batch's rows: no more drafts than its share takes
         const int share = std::max(1, std::min(max_window(), kBatch / count) - 1);
         for (int i = 0; i < count; ++i) {
-            nn[(size_t) i] = std::clamp(n[i], 1, share);
+            nn[(size_t) i] = ss[(size_t) i]->wide_ ? share : std::clamp(n[i], 1, share);
             width[(size_t) i] = ss[(size_t) i]->block_width(nn[(size_t) i]);
             if (pos[i] + width[(size_t) i] > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
         }
@@ -412,17 +421,26 @@ public:
             cudaEventRecord(ss[(size_t) i]->sync_ev_, ss[(size_t) i]->st_.stream);
             cudaStreamWaitEvent(s, ss[(size_t) i]->sync_ev_, 0);
         }
+        std::vector<BlockCtxSeg> ctx_segs;
+        ctx_segs.reserve((size_t) n);
         for (int i = 0; i < n; ++i) {
-            if (Result st = ss[(size_t) i]->settle(reqs[i].pos, true, s); !st.ok()) return st;   // commits on side streams, ctx on s
+            if (Result st = ss[(size_t) i]->settle(reqs[i].pos, true, s, &ctx_segs); !st.ok()) return st;   // commits on side streams
             // MTP drafters run mtp_window on st_.stream using shared m_.ws; serialize before later sessions or forward_batch
             if (ss[(size_t) i]->drafter_ && cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess)
                 return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        }
+        std::string err;
+        for (size_t ci = 0; ci < ctx_segs.size();) {
+            int ck = 0, crows = 0;
+            while (ci + (size_t) ck < ctx_segs.size() && crows + ctx_segs[ci + (size_t) ck].n <= kBatch)
+                crows += ctx_segs[ci + (size_t) ck++].n;
+            if (!block_ctx_batch(m_, ctx_segs.data() + ci, ck, err, s)) return fail(err);
+            ci += (size_t) ck;
         }
         for (int i = 0; i < n; ++i) ss[(size_t) i]->join_commit(s);
         for (int i = 0; i < n; ++i)
             if (ss[(size_t) i]->st_.peer && cudaStreamSynchronize(ss[(size_t) i]->st_.peer->stream) != cudaSuccess)
                 return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
-        std::string err;
         for (int i = 0; i < n; ++i) {
             Session& se = *ss[(size_t) i];
             const model::DecodeRequest& r = reqs[i];
@@ -858,7 +876,9 @@ private:
     }
     // `defer`: the commit's join is left to the caller (join_commit), which queues work beside it first.
     // `ctx_stream`: optional stream on which block_ctx_window runs (for batched calls sharing m_.ws).
-    Result settle(int64_t pos, bool defer = false, cudaStream_t ctx_stream = nullptr) {
+    // `batch_ctx`: when non-null, appends this session's block drafter context update so the caller can batch it.
+    Result settle(int64_t pos, bool defer = false, cudaStream_t ctx_stream = nullptr,
+                  std::vector<BlockCtxSeg>* batch_ctx = nullptr) {
         if (pos == 0) {   // a new conversation: the running state starts empty
             pend_T_ = 0;
             st_.rope_delta = 0;
@@ -911,8 +931,12 @@ private:
             if (!defer) join_commit();
         }
         if (block_ && n > 0) {   // the kept rows become the block drafter's context
-            std::string err;
-            if (!block_ctx_window(m_, st_, (int) n, pend_pos_, err, ctx_stream)) return fail(err);
+            if (batch_ctx) {
+                batch_ctx->push_back({&st_, (int) n, pend_pos_});
+            } else {
+                std::string err;
+                if (!block_ctx_window(m_, st_, (int) n, pend_pos_, err, ctx_stream)) return fail(err);
+            }
         }
         if (drafter_ && n > 0) {
             // the drafter's history: the waiting row with the window's first token, then each kept row with the next

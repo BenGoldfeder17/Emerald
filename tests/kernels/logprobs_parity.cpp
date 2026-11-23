@@ -108,6 +108,11 @@ int run_width(int n_vocab) {
         row_logprobs(d_logits + (size_t) r * n_vocab, 1, n_vocab, d_picks + r, top, d_out, d_scratch, nullptr);
         CU(cudaMemcpy(alone.data(), d_out, alone.size() * sizeof(float), cudaMemcpyDeviceToHost));
         CHECK(std::memcmp(alone.data(), o, (size_t) (2 + 2 * top) * sizeof(float)) == 0);
+        // null picks: o[0] is -inf, lse and top-k entries identical
+        row_logprobs(d_logits + (size_t) r * n_vocab, 1, n_vocab, nullptr, top, d_out, d_scratch, nullptr);
+        CU(cudaMemcpy(alone.data(), d_out, alone.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        CHECK(std::isinf(alone[0]) && alone[0] < 0);
+        CHECK(std::memcmp(alone.data() + 1, o + 1, (size_t) (1 + 2 * top) * sizeof(float)) == 0);
     }
     CHECK(max_abs < 2e-6);
     std::printf("row_logprobs n_vocab=%d: vs the double reference max abs %.3g, max rel %.3g; ids exact; width-independent\n",

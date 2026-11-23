@@ -1064,6 +1064,54 @@ bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::strin
     return cuda_ok("block drafter context", err);
 }
 
+bool block_ctx_batch(Model& m, const BlockCtxSeg* segs, int S, std::string& err, cudaStream_t stream) {
+    if (S <= 0) return true;
+    if (S == 1) return block_ctx_window(m, *segs[0].st, segs[0].n, segs[0].pos, err, stream);
+    const BlockDrafter& bd = m.bd_dec;
+    WindowScratch& b = m.ws;
+    const cudaStream_t s = stream ? stream : segs[0].st->stream;
+    const int H = m.g.n_embd, KV = bd.n_kv * bd.head_dim;
+    int r0[kBatch + 1] = {};
+    int32_t p3[kBatch * 3];
+    for (int k = 0; k < S; ++k) {
+        r0[k + 1] = r0[k] + segs[k].n;
+        for (int t = 0; t < segs[k].n; ++t) {
+            int32_t* q = &p3[(r0[k] + t) * 3];
+            q[0] = q[1] = q[2] = (int32_t) (segs[k].pos + t);
+        }
+    }
+    const int R = r0[S];
+    const int32_t bounds[2] = {0, R};
+    cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(b.bpos, p3, (size_t) R * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    kernels::PdlScope pdl(true, true);
+    const int ktype = bd.layers[0].k.type;
+    const void* xq = nullptr;
+    if (on_wg(ktype)) {
+        for (int k = 0; k < S; ++k)
+            wg::norm_pack(segs[k].st->dacc, bd.hidden_norm, bd.eps, H, segs[k].n,
+                          static_cast<uint16_t*>(b.xq) + (size_t) r0[k] * H, b.xn + (size_t) r0[k] * H, s);
+        xq = b.xq;
+    } else {
+        for (int k = 0; k < S; ++k)
+            kernels::rms_norm_rows(segs[k].st->dacc, bd.hidden_norm, b.xn + (size_t) r0[k] * H, segs[k].n, H, bd.eps, s);
+        xq = wact(m, b.xn, ktype, H, R, s);
+    }
+    const kernels::RopeSpec rope = block_rope(bd);
+    for (size_t l = 0; l < bd.layers.size(); ++l) {
+        const BlockDrafter::Layer& D = bd.layers[l];
+        prod_group(m, b.xn, xq, D.k.type, {{&D.k, b.bk}, {&D.v, b.bv}}, R, s);
+        for (int k = 0; k < S; ++k) {
+            SessionState& st = *segs[k].st;
+            const size_t q0 = (size_t) r0[k];
+            kernels::attn_qk_prepare(nullptr, b.bk + q0 * KV, b.bv + q0 * KV, nullptr, D.k_norm, bd.eps, rope,
+                                     b.bpos + q0 * 3, segs[k].n, 0, bd.n_kv, nullptr, st.dk[l], st.dv[l], segs[k].pos, s,
+                                     bd.head_dim, false, st.dctx_cap);
+        }
+    }
+    return cuda_ok("block drafter context", err);
+}
+
 bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, int width, std::string& err) {
     SessionState* sts[1] = {&st};
     return block_draft_batch(m, sts, &anchor, &pos, &width, 1, err);
@@ -1124,18 +1172,21 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
         kernels::PdlScope pdl(true, true);   // after the uploads: each product stages its weights during the kernel before
         embed_rows(m, b.tok, R, s);
         const kernels::RopeSpec rope = block_rope(bd);
-        // the dynamic convolution runs along each block's own rows into b.bh
-        const auto conv = [&](const float* x, const float* dyn, int64_t ld_dyn, const float* base) {
-            for (int k = 0; k < S; ++k)
-                kernels::dyn_conv2(x + (size_t) r0[k] * H, dyn + (size_t) r0[k] * ld_dyn, ld_dyn, base, b.bh + (size_t) r0[k] * H,
-                                   widths[k], H, bd.conv_group, s);
-        };
+        uint32_t first_mask = 0;
+        for (int k = 0; k < S; ++k) first_mask |= 1u << r0[k];
         for (size_t l = 0; l < bd.layers.size(); ++l) {
             const BlockDrafter::Layer& D = bd.layers[l];
-            // attention, its input and output through the dynamic convolution
+            // attention: fuse dyn_conv2 directly into BF16 b.xq (before q/k/v) and BF16 residual b.x (after o),
+            // and write windowed attention straight into BF16 b.xq when D.o runs on window_gemm
             prod(m, D.conv_a, wnorm(m, b.x, D.attn_norm, b.xn, D.conv_a.type, H, R, bd.eps, s), b.dyn, R, s);
-            conv(b.xn, b.dyn, D.conv_a.rows, D.base_a);
-            prod_group(m, b.bh, wact(m, b.bh, D.q.type, H, R, s), D.q.type, {{&D.q, b.bq}, {&D.k, b.bk}, {&D.v, b.bv}}, R, s);
+            if (on_wg(D.q.type) && D.k.type == D.q.type && D.v.type == D.q.type) {
+                kernels::dyn_conv2_bf16(b.xn, b.dyn, D.conv_a.rows, D.base_a, static_cast<uint16_t*>(b.xq), R, H,
+                                        bd.conv_group, s, first_mask);
+                prod_group(m, nullptr, b.xq, D.q.type, {{&D.q, b.bq}, {&D.k, b.bk}, {&D.v, b.bv}}, R, s);
+            } else {
+                kernels::dyn_conv2(b.xn, b.dyn, D.conv_a.rows, D.base_a, b.bh, R, H, bd.conv_group, s, first_mask);
+                prod_group(m, b.bh, wact(m, b.bh, D.q.type, H, R, s), D.q.type, {{&D.q, b.bq}, {&D.k, b.bk}, {&D.v, b.bv}}, R, s);
+            }
             kernels::GqaWinSeg wsegs[kBatch];
             for (int k = 0; k < S; ++k) {
                 SessionState& st = *sts[k];
@@ -1147,22 +1198,30 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
                                          bd.head_dim, false, st.dctx_cap, p0_dev);
                 wsegs[k] = {B, st.dk[l], st.dv[l], 0, 0, 0, st.dctx_cap, p0_dev};
             }
-            kernels::gqa_window_attn_segs(b.bqo, bd.n_head, bd.n_kv, bd.head_dim, wsegs, S, b.battn, sts[0]->dctx_cap, b.bao, s);
-            prod(m, D.o, wact(m, b.bao, D.o.type, AQ, R, s), b.tmp, R, s);
-            conv(b.tmp, b.dyn + 2 * groups, D.conv_a.rows, D.base_a + 2 * H);
-            kernels::add_scaled(b.x, b.bh, nullptr, (int64_t) R * H, s);
-            // the FFN, likewise (fused SwiGLU straight into BF16 b.hq when down runs on window_gemm)
+            if (on_wg(D.o.type)) {
+                kernels::gqa_window_attn_segs(b.bqo, bd.n_head, bd.n_kv, bd.head_dim, wsegs, S, b.battn, sts[0]->dctx_cap,
+                                              nullptr, s, static_cast<uint16_t*>(b.xq));
+                prod(m, D.o, b.xq, b.tmp, R, s);
+            } else {
+                kernels::gqa_window_attn_segs(b.bqo, bd.n_head, bd.n_kv, bd.head_dim, wsegs, S, b.battn, sts[0]->dctx_cap, b.bao, s);
+                prod(m, D.o, wact(m, b.bao, D.o.type, AQ, R, s), b.tmp, R, s);
+            }
+            kernels::dyn_conv2_add_bf16(b.tmp, b.dyn + 2 * groups, D.conv_a.rows, D.base_a + 2 * H, b.x, R, H,
+                                        bd.conv_group, s, first_mask);
+            // the FFN, likewise (fused dyn_conv2 -> BF16 b.xq, SwiGLU -> BF16 b.hq, and dyn_conv2 += b.x)
             prod(m, D.conv_f, wnorm(m, b.x, D.ffn_norm, b.xn, D.conv_f.type, H, R, bd.eps, s), b.dyn, R, s);
-            conv(b.xn, b.dyn, D.conv_f.rows, D.base_f);
             if (on_wg(D.down.type) && D.gate.type == kTypeNvfp4Planes && D.up.type == kTypeNvfp4Planes) {
-                prod_swiglu(m, D.gate, D.up, b.bh, wact(m, b.bh, D.gate.type, H, R, s), nullptr, R, s, b.hq);
+                kernels::dyn_conv2_bf16(b.xn, b.dyn, D.conv_f.rows, D.base_f, static_cast<uint16_t*>(b.xq), R, H,
+                                        bd.conv_group, s, first_mask);
+                prod_swiglu(m, D.gate, D.up, nullptr, b.xq, nullptr, R, s, b.hq);
                 prod(m, D.down, b.hq, b.tmp, R, s);
             } else {
+                kernels::dyn_conv2(b.xn, b.dyn, D.conv_f.rows, D.base_f, b.bh, R, H, bd.conv_group, s, first_mask);
                 prod_swiglu(m, D.gate, D.up, b.bh, wact(m, b.bh, D.gate.type, H, R, s), b.h, R, s);
                 prod(m, D.down, wact(m, b.h, D.down.type, D.gate.rows, R, s), b.tmp, R, s);
             }
-            conv(b.tmp, b.dyn + 2 * groups, D.conv_f.rows, D.base_f + 2 * H);
-            kernels::add_scaled(b.x, b.bh, nullptr, (int64_t) R * H, s);
+            kernels::dyn_conv2_add_bf16(b.tmp, b.dyn + 2 * groups, D.conv_f.rows, D.base_f + 2 * H, b.x, R, H,
+                                        bd.conv_group, s, first_mask);
         }
         // slots 1 .. B-1 of each block: skip the anchor row (row 0 of each block) before the LM head and selector
         const uint16_t* x_head = b.x;
@@ -1200,12 +1259,18 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
             if (!on_wg(hd.type)) wg::pack(b.xn, H, H, R_head, b.xq, s);
             wg::gemm(c, on_wg(hd.type) ? hq : b.xq, R_head, m.ws.w8, s);
         }
-        for (int k = 0; k < S; ++k) {
-            const size_t out_off = skip_anchors ? (size_t) (r0[k] - k) : (size_t) (r0[k] + 1);
-            const size_t q0 = (size_t) r0[k];
-            const int B = widths[k];
-            kernels::row_logprobs(b.hl + out_off * (size_t) nv, B - 1, nv, b.tok + q0 + 1, bd.top_k,
-                                  b.blp + (size_t) (r0[k] - k) * kernels::kLogprobStride, b.lp_scratch, s);
+        if (skip_anchors) {
+            // all S sessions' scored rows sit contiguously in b.hl[0..R_head-1] and b.blp[0..R_head-1]; candidate_path
+            // only reads the top-k candidate pairs (never o[0]), so one batched launch covers the whole batch
+            kernels::row_logprobs(b.hl, R_head, nv, nullptr, bd.top_k, b.blp, b.lp_scratch, s);
+        } else {
+            for (int k = 0; k < S; ++k) {
+                const size_t out_off = (size_t) (r0[k] + 1);
+                const size_t q0 = (size_t) r0[k];
+                const int B = widths[k];
+                kernels::row_logprobs(b.hl + out_off * (size_t) nv, B - 1, nv, b.tok + q0 + 1, bd.top_k,
+                                      b.blp + (size_t) (r0[k] - k) * kernels::kLogprobStride, b.lp_scratch, s);
+            }
         }
     };
 

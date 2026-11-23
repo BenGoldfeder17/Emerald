@@ -219,6 +219,41 @@ int main() {
                 want[(size_t) t * H + c] = a;
             }
         report("dyn_conv2", y, want, 1e-5);
+        // fused BF16 store, fused BF16 residual add, and multi-block first_mask (two blocks of 4 rows):
+        // compare bitwise against unfused dyn_conv2 (per block) + to_bf16 / add_scaled on GPU
+        const uint32_t mask2 = (1u << 0) | (1u << 4);
+        float* dy_ref = nullptr;
+        uint16_t *dy16 = nullptr, *dy16_ref = nullptr;
+        cudaMalloc(&dy_ref, (size_t) T * H * 4);
+        cudaMalloc(&dy16, (size_t) T * H * 2);
+        cudaMalloc(&dy16_ref, (size_t) T * H * 2);
+        basalt::kernels::dyn_conv2(dx, dd + 2 * groups, LD, db, dy_ref, 4, H, G, S);
+        basalt::kernels::dyn_conv2(dx + 4 * H, dd + 4 * LD + 2 * groups, LD, db, dy_ref + 4 * H, 4, H, G, S);
+        basalt::kernels::to_bf16(dy_ref, dy16_ref, (size_t) T * H, S);
+        basalt::kernels::dyn_conv2_bf16(dx, dd + 2 * groups, LD, db, dy16, T, H, G, S, mask2);
+        auto y16 = down(dy16, (size_t) T * H);
+        auto y16_ref = down(dy16_ref, (size_t) T * H);
+        std::vector<uint16_t> res0((size_t) T * H);
+        for (auto& v : res0) v = bf(0.5f * nd(rng));
+        uint16_t* dres = up(res0);
+        uint16_t* dres_ref = up(res0);
+        basalt::kernels::add_scaled(dres_ref, dy_ref, nullptr, (size_t) T * H, S);
+        basalt::kernels::dyn_conv2_add_bf16(dx, dd + 2 * groups, LD, db, dres, T, H, G, S, mask2);
+        auto res1 = down(dres, (size_t) T * H);
+        auto res1_ref = down(dres_ref, (size_t) T * H);
+        int bf_diff = 0, add_diff = 0;
+        for (size_t idx = 0; idx < (size_t) T * H; ++idx) {
+            if (y16[idx] != y16_ref[idx]) ++bf_diff;
+            if (res1[idx] != res1_ref[idx]) ++add_diff;
+        }
+        std::printf("dyn_conv2_bf16/add_bf16 bitwise diffs vs unfused: bf16=%d add_bf16=%d%s\n", bf_diff, add_diff,
+                    (bf_diff || add_diff) ? "  FAIL" : "");
+        if (bf_diff || add_diff) ++fails;
+        cudaFree(dy_ref);
+        cudaFree(dy16);
+        cudaFree(dy16_ref);
+        cudaFree(dres);
+        cudaFree(dres_ref);
     }
     {   // candidate_path against the same walk on the CPU
         const int V = 4096, R = 256, K = 16, P = 7;
@@ -307,6 +342,18 @@ int main() {
                 }
             }
         report("gqa_window_attn", out, want, 2e-4);
+        // fused plain BF16 output via gqa_window_attn_segs (out=nullptr, out16!=nullptr) must be bitwise bf(out)
+        uint16_t* dout16 = nullptr;
+        cudaMalloc(&dout16, (size_t) B * NH * HD * 2);
+        basalt::kernels::GqaWinSeg seg{B, dk, dv, pos, pos + B, W, CAP, nullptr};
+        basalt::kernels::gqa_window_attn_segs(dq, NH, NKV, HD, &seg, 1, dscr, CAP, nullptr, S, dout16);
+        auto out16 = down(dout16, (size_t) B * NH * HD);
+        int gqa16_diff = 0;
+        for (size_t i = 0; i < out.size(); ++i)
+            if (out16[i] != bf(out[i])) ++gqa16_diff;
+        std::printf("gqa_window_attn_segs out16 bitwise diffs: %d%s\n", gqa16_diff, gqa16_diff ? "  FAIL" : "");
+        if (gqa16_diff) ++fails;
+        cudaFree(dout16);
     }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

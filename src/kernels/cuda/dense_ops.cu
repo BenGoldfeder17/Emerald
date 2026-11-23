@@ -365,8 +365,9 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
     }
 }
 
-__global__ void dyn_conv2_kernel(const float* x, const float* dyn, int64_t ld_dyn, const float* __restrict__ base, float* out,
-                                 int64_t T, int64_t H, int group) {
+template <int Mode>
+__global__ void dyn_conv2_kernel(const float* x, const float* dyn, int64_t ld_dyn, const float* __restrict__ base, void* out,
+                                 int64_t T, int64_t H, int group, uint32_t first_mask) {
     pdl_launch_dependents();
     pdl_wait();
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -375,8 +376,16 @@ __global__ void dyn_conv2_kernel(const float* x, const float* dyn, int64_t ld_dy
     const int64_t groups = H / group;
     const float* dr = dyn + t * ld_dyn;
     float acc = (base[c] + dr[c / group]) * x[i];
-    if (t > 0) acc += (base[H + c] + dr[groups + c / group]) * x[i - H];
-    out[i] = acc;
+    const bool is_first = t < 32 ? ((first_mask >> (unsigned) t) & 1u) != 0 : false;
+    if (!is_first) acc += (base[H + c] + dr[groups + c / group]) * x[i - H];
+    if constexpr (Mode == 0) {
+        static_cast<float*>(out)[i] = acc;
+    } else if constexpr (Mode == 1) {
+        static_cast<__nv_bfloat16*>(out)[i] = __float2bfloat16_rn(acc);
+    } else {
+        __nv_bfloat16* x16 = static_cast<__nv_bfloat16*>(out);
+        x16[i] = __float2bfloat16_rn(__fadd_rn(__bfloat162float(x16[i]), acc));
+    }
 }
 
 // One block of `rank` threads walks the positions: the predecessor's row times h into shared memory, then each warp
@@ -686,10 +695,27 @@ void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint1
 }
 
 void dyn_conv2(const float* x, const float* dyn, int64_t ld_dyn, const float* base, float* out, int64_t T, int64_t H,
-               int group, void* stream) {
+               int group, void* stream, uint32_t first_mask) {
     if (T <= 0) return;
-    launch_pdl(dyn_conv2_kernel, blocks_for(T * H), dim3(256), 0, (cudaStream_t) stream, x, dyn, ld_dyn, base, out, T, H, group);
+    launch_pdl(dyn_conv2_kernel<0>, blocks_for(T * H), dim3(256), 0, (cudaStream_t) stream, x, dyn, ld_dyn, base, (void*) out,
+               T, H, group, first_mask);
     check("dyn_conv2");
+}
+
+void dyn_conv2_bf16(const float* x, const float* dyn, int64_t ld_dyn, const float* base, uint16_t* out16, int64_t T,
+                    int64_t H, int group, void* stream, uint32_t first_mask) {
+    if (T <= 0) return;
+    launch_pdl(dyn_conv2_kernel<1>, blocks_for(T * H), dim3(256), 0, (cudaStream_t) stream, x, dyn, ld_dyn, base,
+               (void*) out16, T, H, group, first_mask);
+    check("dyn_conv2_bf16");
+}
+
+void dyn_conv2_add_bf16(const float* x, const float* dyn, int64_t ld_dyn, const float* base, uint16_t* x16, int64_t T,
+                        int64_t H, int group, void* stream, uint32_t first_mask) {
+    if (T <= 0) return;
+    launch_pdl(dyn_conv2_kernel<2>, blocks_for(T * H), dim3(256), 0, (cudaStream_t) stream, x, dyn, ld_dyn, base, (void*) x16,
+               T, H, group, first_mask);
+    check("dyn_conv2_add_bf16");
 }
 
 void candidate_path(const float* lp_rows, int stride, int top, const float* h, const uint16_t* pred, const uint16_t* succ,

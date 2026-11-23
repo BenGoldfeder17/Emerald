@@ -110,8 +110,8 @@ __global__ void __launch_bounds__(HD) decode_merge_kernel(const float* part, int
     const int64_t i = ((int64_t) row * n_head + h) * HD + d;
     if (out) out[i] = o;
     if (gated16) {
-        const float g = gate_q[((int64_t) row * n_head + h) * 2 * HD + HD + d];
-        gated16[i] = __bfloat16_as_ushort(__float2bfloat16_rn(o / (1.0f + expf(-g))));
+        const float v = gate_q ? o / (1.0f + expf(-gate_q[((int64_t) row * n_head + h) * 2 * HD + HD + d])) : o;
+        gated16[i] = __bfloat16_as_ushort(__float2bfloat16_rn(v));
     }
 }
 
@@ -1111,7 +1111,7 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
 }
 
 void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, const GqaWinSeg* segs, int n_seg,
-                          float* scratch, int64_t scratch_cells, float* out, void* stream) {
+                          float* scratch, int64_t scratch_cells, float* out, void* stream, uint16_t* out16) {
     if (n_seg < 1 || n_seg > kMaxSegs || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX ||
         (head_dim != 128 && head_dim != 256)) {
         basalt::log::error("basalt", "gqa_window_attn_segs: invalid arguments");
@@ -1140,8 +1140,8 @@ void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, co
             d.r[k].base = (int) (lo / CHUNK);
         }
     }
-    if (head_dim == 128) launch_segs<128>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream);
-    else launch_segs<256>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream);
+    if (head_dim == 128) launch_segs<128>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream, nullptr, out16);
+    else launch_segs<256>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream, nullptr, out16);
 }
 
 void gqa_prompt_plan_device(int device) { plan_device.store(device, std::memory_order_relaxed); }

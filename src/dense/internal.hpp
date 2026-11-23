@@ -299,7 +299,13 @@ bool prompt_split_read(Stage& stage, Model& main, SessionState& st, const int32_
 void commit_window(Model& m, SessionState& st, int n, cudaStream_t s);
 
 /// The block drafter's context from the last window's first n rows (st.dacc) at positions pos.. .
+struct BlockCtxSeg {
+    SessionState* st = nullptr;
+    int n = 0;
+    int64_t pos = 0;
+};
 bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err, cudaStream_t stream = nullptr);
+bool block_ctx_batch(Model& m, const BlockCtxSeg* segs, int S, std::string& err, cudaStream_t stream);
 /// The block drafter's pass after `anchor` at `pos`: its picks for slots 1 .. block-1 into st.dids / st.dconf.
 /// The block is `width` rows (the drafter's block or wider, up to kWindow: one anchor, then mask tokens).
 bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, int width, std::string& err);

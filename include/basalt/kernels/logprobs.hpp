@@ -8,8 +8,8 @@
 // into kLogprobChunk-wide chunks (one block each: max, exp sum, top candidates), then one block per row merges them in
 // chunk order with the sum in double, so a row's values do not depend on the batch width or its place in it.
 //
-// `logits` and `scratch` (row_logprobs_scratch_floats) are DEVICE pointers; `picks` and `out` device or mapped host
-// pointers. Two launches on `stream`; capturable.
+// `logits` and `scratch` (row_logprobs_scratch_floats) are DEVICE pointers; `picks` (may be null, leaving [0] at -inf)
+// and `out` device or mapped host pointers. Two launches on `stream`; capturable.
 #pragma once
 
 #include <cstddef>

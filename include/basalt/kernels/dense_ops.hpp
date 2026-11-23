@@ -83,10 +83,17 @@ void attn_gate_bf16(const float* attn, const uint16_t* q_full, int64_t T, int n_
                     void* stream);
 
 /// A block drafter's two-tap grouped dynamic convolution along a block's rows (DFlash 2):
-/// out[t][c] = sum over o in {0, 1} of (base[o][c] + dyn[t][o * groups + c / group]) * x[t - o][c], x[-1] = 0.
-/// x, out [T][H]; base [2][H]; dyn rows `ld_dyn` floats apart.
+/// out[t][c] = sum over o in {0, 1} of (base[o][c] + dyn[t][o * groups + c / group]) * x[t - o][c], with the t - 1 tap
+/// zeroed on any row t (< 32) whose bit is set in `first_mask` (default 1u: row 0 only; batched blocks set each block's
+/// start row).  x, out [T][H]; base [2][H]; dyn rows `ld_dyn` floats apart.
 void dyn_conv2(const float* x, const float* dyn, int64_t ld_dyn, const float* base, float* out, int64_t T, int64_t H,
-               int group, void* stream);
+               int group, void* stream, uint32_t first_mask = 1u);
+/// Same as dyn_conv2, rounded directly to BF16 rows in `out16` (for window_gemm activations, bitwise dyn_conv2 + pack).
+void dyn_conv2_bf16(const float* x, const float* dyn, int64_t ld_dyn, const float* base, uint16_t* out16, int64_t T,
+                    int64_t H, int group, void* stream, uint32_t first_mask = 1u);
+/// Same as dyn_conv2, added directly into the BF16 residual `x16` in fp32 rounded once (bitwise dyn_conv2 + add_scaled).
+void dyn_conv2_add_bf16(const float* x, const float* dyn, int64_t ld_dyn, const float* base, uint16_t* x16, int64_t T,
+                        int64_t H, int group, void* stream, uint32_t first_mask = 1u);
 /// How candidate_path picks: temperature <= 0 the best score; above 0 a draw from softmax(score / temperature) on
 /// Philox's draft stream at (seed, pos0 + position).  q_ids / q_p (optional, device [n][top]): the candidates and the
 /// distribution the pick came from (one-hot at the best for an argmax pick), what speculative sampling keeps drafts by.

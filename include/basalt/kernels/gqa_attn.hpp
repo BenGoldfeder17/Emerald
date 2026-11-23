@@ -84,7 +84,7 @@ struct GqaWinSeg {
     const int32_t* win_dev = nullptr;   // device int32[4]: {pos0, hi, window, base}
 };
 void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, const GqaWinSeg* segs, int n_seg,
-                          float* scratch, int64_t scratch_cells, float* out, void* stream);
+                          float* scratch, int64_t scratch_cells, float* out, void* stream, uint16_t* out16 = nullptr);
 /// The device whose SM count plans the int8 prompt attention's launch (its key splits, so its rounding); -1 (the default):
 /// the current one.  A card that reads some of the main card's layers plans as the main card, so its rows are the main card's.
 void gqa_prompt_plan_device(int device);
