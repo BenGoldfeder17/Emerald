@@ -192,10 +192,12 @@ public:
         block_ = m_.o.drafter == Drafter::Block;
         if (!init_state(m_, st_, err)) return false;
         if (m_.split && !split_session(m_, st_, err)) return false;
-        if (cudaHostAlloc((void**) &h_picks_, kWindow * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess) {
+        if (cudaHostAlloc((void**) &h_picks_, 3 * kWindow * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess) {
             err = "out of page-locked memory";
             return false;
         }
+        h_dids_ = h_picks_ + kWindow;
+        h_dconf_ = reinterpret_cast<float*>(h_picks_ + 2 * kWindow);
         if (cudaEventCreateWithFlags(&sync_ev_, cudaEventDisableTiming) != cudaSuccess) {
             err = "cannot create a CUDA event";
             return false;
@@ -209,6 +211,7 @@ public:
     }
 
     bool copy_drafts() const override { return max_window() > 1; }
+    bool flat_draft_cost() const override { return block_ && !m_.split && m_.o.kv_resident == 0; }
 
     // The block drafter's width for n drafts: its own block, or wider (up to the window) right after a window that kept
     // most of a block, so a run of accepted drafts can grow past the block; the policy reads each draft's confidence.
@@ -321,14 +324,14 @@ public:
     struct Lazy {
         double ms = 0.0;   // the wait's usual length, 0 while unknown
     };
-    bool wait_stream(cudaStream_t s, Lazy& w) {
+    bool wait_stream(cudaStream_t s, Lazy& w, double max_ms = 500.0) {
         if (!m_.o.lazy_wait) return cudaStreamSynchronize(s) == cudaSuccess;
         if (cudaStreamQuery(s) == cudaSuccess) return true;   // already finished (e.g. peers after a shared draft_batch)
         (void) cudaGetLastError();
         using Clock = std::chrono::steady_clock;
         const Clock::time_point t0 = Clock::now();
         bool overslept = false;
-        const double sleep_ms = w.ms * 0.85 - 1.0;
+        const double sleep_ms = std::min(w.ms * 0.85 - 1.0, max_ms * 0.85);
         if (sleep_ms >= 2.0) {
             platform::sleep_precise((int64_t) (sleep_ms * 1000.0));
             overslept = cudaStreamQuery(s) == cudaSuccess;
@@ -337,7 +340,9 @@ public:
         const bool ok = cudaStreamSynchronize(s) == cudaSuccess;
         if (overslept) w.ms *= 0.85;
         else {
-            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            const double raw = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            // clamp outliers (e.g. standby/driver stall or cold first launch) so one hiccup cannot cause multi-second sleeps
+            const double ms = w.ms == 0.0 ? std::min(raw, max_ms) : std::min(raw, std::min(2.0 * w.ms + 5.0, max_ms));
             // adapt down quickly on genuine speedups, up slowly so a single slow outlier does not cause oversleeping
             const double alpha = ms < w.ms ? 0.5 : 0.15;
             w.ms = w.ms == 0.0 ? ms : (1.0 - alpha) * w.ms + alpha * ms;
@@ -351,10 +356,13 @@ public:
     Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
         if (block_) {
             n = std::min(n_draft_, max_n);
-            if (cudaMemcpyAsync(ids, st_.dids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
-                cudaMemcpyAsync(conf, st_.dconf, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
-                !wait_stream(st_.stream, lazy_draft_[std::clamp(draft_rows_, 0, kBatch)]))
+            // stage through page-locked buffers so cudaMemcpyAsync stays truly async and wait_stream sleeps instead of spinning
+            if (cudaMemcpyAsync(h_dids_, st_.dids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
+                cudaMemcpyAsync(h_dconf_, st_.dconf, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
+                !wait_stream(st_.stream, lazy_draft_[std::clamp(draft_rows_, 0, kBatch)], 100.0))
                 return fail(m_.o.arch + ": the block drafter failed");
+            std::copy(h_dids_, h_dids_ + n, ids);
+            std::copy(h_dconf_, h_dconf_ + n, conf);
             return {};
         }
         if (!drafter_) return {Status::NotImplemented, m_.o.arch + ": no drafter is loaded"};
@@ -499,7 +507,7 @@ public:
             // a full chunk's time depends on where it starts (attention reads the cells before it): a wait per place
             Lazy other;
             Lazy& lazy = n == kChunk ? lazy_chunk_[std::min<int64_t>(p / kChunk, 64)] : other;
-            if (!wait_stream(st_.stream, lazy)) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+            if (!wait_stream(st_.stream, lazy, 4000.0)) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
             at += n;
             if (r.progress) r.progress(at);
             if (at < r.n_tokens && r.stop && r.stop()) break;
@@ -1034,6 +1042,8 @@ private:
     const Geometry& g_;
     SessionState st_;
     int32_t* h_picks_ = nullptr;
+    int32_t* h_dids_ = nullptr;
+    float* h_dconf_ = nullptr;
     bool drafter_ = false, block_ = false;
     int n_draft_ = 0;
     int draft_rows_ = 0;

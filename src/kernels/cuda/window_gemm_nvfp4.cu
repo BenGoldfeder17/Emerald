@@ -5,19 +5,18 @@
 
 namespace basalt::kernels::wgemm::detail {
 namespace {
-constexpr int F = (int) Format::Nvfp4, CH = 256, MW = 1;
+constexpr int F = (int) Format::Nvfp4, CH = 256, ST = 4, MW = 1;
 }
 
 const Kernel& nvfp4(int nt) {
-    static const Kernel k1 = make_kernel<F, 64, 1, CH, 4, 1, MW>(), k2 = make_kernel<F, 64, 1, CH, 4, 2, MW>(),
-                        k3 = make_kernel<F, 64, 1, CH, 4, 3, MW>(), k4 = make_kernel<F, 64, 1, CH, 4, 4, MW>();
+    static const Kernel k1 = make_kernel<F, 64, 1, CH, ST, 1, MW>(), k2 = make_kernel<F, 64, 1, CH, ST, 2, MW>(),
+                        k3 = make_kernel<F, 64, 1, CH, ST, 3, MW>(), k4 = make_kernel<F, 64, 1, CH, ST, 4, MW>();
     return nt > 3 ? k4 : nt > 2 ? k3 : nt > 1 ? k2 : k1;
 }
 
 const Kernel& nvfp4_swiglu(int nt) {
-    // NT == 1 (148 regs) fits 3 blocks/SM with ST = 3; NT >= 2 (186-222 regs) is register-capped at 2 blocks/SM so keeps ST = 4
-    static const Kernel k1 = make_kernel<F, 32, 2, CH, 3, 1, MW>(), k2 = make_kernel<F, 32, 2, CH, 4, 2, MW>(),
-                        k3 = make_kernel<F, 32, 2, CH, 4, 3, MW>(), k4 = make_kernel<F, 32, 2, CH, 4, 4, MW>();
+    static const Kernel k1 = make_kernel<F, 32, 2, CH, ST, 1, MW>(), k2 = make_kernel<F, 32, 2, CH, ST, 2, MW>(),
+                        k3 = make_kernel<F, 32, 2, CH, ST, 3, MW>(), k4 = make_kernel<F, 32, 2, CH, ST, 4, MW>();
     return nt > 3 ? k4 : nt > 2 ? k3 : nt > 1 ? k2 : k1;
 }
 

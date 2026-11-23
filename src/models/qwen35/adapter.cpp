@@ -304,6 +304,7 @@ private:
                               g.n_layers - 1, req.peer_devices.front());
         o.host_embedding_bytes = embd_dev_ ? 0 : embd_bytes;
         o.lazy_wait = req.lazy_wait;
+        o.vram_reserve_mib = std::max(req.vram_reserve_mib, 0);
         o.gpu_weight_bytes = dev_bytes_ + peer_bytes_;
         o.layer_end = split_at_;
         if (o.vision) {

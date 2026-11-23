@@ -255,7 +255,7 @@ bool decode_drafter(Model& m, std::string& err) {
     // fc as NVFP4 copies (prompt chunks still read Q8_0 blocks): halves the bytes read on every target verify window
     for (Linear& l : bd.fc) ok = ok && copy_fp4(l);
     // optional NVFP4 copy of the FP8 LM head's leading kDraftVocab rows for the drafter pass alone (the target model
-    // always verifies against the exact FP8 m.w.head); skipped cleanly if VRAM headroom above the sessions is tight
+    // always verifies against the exact FP8 m.w.head); accounts for sessions, lazy prompt scratch and --vram-reserve-mib
     if (ok && m.w.head.type == kTypeF8) {
         const int64_t nv = m.w.head.rows > kDraftVocab ? kDraftVocab : m.w.head.rows;
         if (kernels::nvfp4p::fits(nv, m.w.head.cols)) {
@@ -266,7 +266,9 @@ bool decode_drafter(Model& m, std::string& err) {
                 (uint64_t) std::max(m.o.sessions, 1) *
                 (session_bytes(m.g, m.o.max_context, false, m.o.kv_int8, m.o.kv_resident, m.lb, m.le) +
                  block_session_bytes(m.g, m.w.dflash));
-            if (free_b > sess_b + hb + (1024ull << 20)) {
+            const uint64_t chunk_b = chunk_bytes(m.g);
+            const uint64_t reserve_b = (uint64_t) std::max(m.o.vram_reserve_mib, 0) << 20;
+            if (free_b > sess_b + chunk_b + reserve_b + hb + (512ull << 20)) {
                 void* p = nullptr;
                 void* sc = nullptr;
                 if (cudaMalloc(&p, hb) == cudaSuccess && cudaMalloc(&sc, 16) == cudaSuccess) {
@@ -281,11 +283,16 @@ bool decode_drafter(Model& m, std::string& err) {
                         return true;
                     });
                     bd.draft_head = {kTypeNvfp4Planes, p, nv, cols, (const float*) sc, nullptr};
+                    basalt::log::info("basalt dense", "block drafter head: NVFP4 copy of %lld rows (%.0f MiB)",
+                                      (long long) nv, (double) hb / 1048576.0);
                 } else {
                     if (p) cudaFree(p);
                     if (sc) cudaFree(sc);
                     (void) cudaGetLastError();
+                    basalt::log::info("basalt dense", "block drafter head: using FP8 head (NVFP4 copy allocation failed)");
                 }
+            } else {
+                basalt::log::info("basalt dense", "block drafter head: using FP8 head (tight VRAM headroom)");
             }
         }
     }
@@ -293,10 +300,10 @@ bool decode_drafter(Model& m, std::string& err) {
         err = m.o.arch + ": laying out the block drafter for decode windows failed";
         return false;
     }
-    // the workspace for the drafter's calls (each matrix, q + k + v, k + v)
+    // the workspace for the drafter's calls (each matrix, q + k + v, k + v, gate + up)
     namespace wg = kernels::wgemm;
     size_t need_p = m.ws.w8.partial_floats, need_t = m.ws.w8.tickets_n;
-    auto need = [&](std::initializer_list<const Linear*> ls) {
+    auto need = [&](std::initializer_list<const Linear*> ls, wg::Epilogue epi = wg::Epilogue::Store) {
         wg::Call c;
         c.fmt = wg::Format::Q8;
         c.n = 0;
@@ -306,7 +313,7 @@ bool decode_drafter(Model& m, std::string& err) {
             c.K = l->cols;
             c.m[c.n++].rows = l->rows;
         }
-        if (ls.size() == 2 && c.fmt == wg::Format::Nvfp4) c.epi = wg::Epilogue::SwiGLU;   // the FFN pair
+        if (epi == wg::Epilogue::SwiGLU && c.fmt == wg::Format::Nvfp4) c.epi = wg::Epilogue::SwiGLU;
         size_t p, t;
         wg::workspace_need(c, p, t);
         need_p = std::max(need_p, p);
@@ -316,7 +323,7 @@ bool decode_drafter(Model& m, std::string& err) {
         for (const Linear* l : {&D.q, &D.k, &D.v, &D.o, &D.gate, &D.up, &D.down, &D.conv_a, &D.conv_f}) need({l});
         need({&D.q, &D.k, &D.v});
         need({&D.k, &D.v});
-        need({&D.gate, &D.up});
+        need({&D.gate, &D.up}, wg::Epilogue::SwiGLU);
     }
     for (const Linear& l : bd.fc) need({&l});
     if (bd.draft_head.w) need({&bd.draft_head});

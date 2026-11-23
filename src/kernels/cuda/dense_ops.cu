@@ -376,7 +376,7 @@ __global__ void dyn_conv2_kernel(const float* x, const float* dyn, int64_t ld_dy
     const int64_t groups = H / group;
     const float* dr = dyn + t * ld_dyn;
     float acc = (base[c] + dr[c / group]) * x[i];
-    const bool is_first = t < 32 ? ((first_mask >> (unsigned) t) & 1u) != 0 : false;
+    const bool is_first = t == 0 || (t < 32 && ((first_mask >> (unsigned) t) & 1u) != 0);
     if (!is_first) acc += (base[H + c] + dr[groups + c / group]) * x[i - H];
     if constexpr (Mode == 0) {
         static_cast<float*>(out)[i] = acc;

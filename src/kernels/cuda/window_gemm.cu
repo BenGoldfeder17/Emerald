@@ -194,8 +194,6 @@ Plan plan_for(const Call& c) {
         return p;
     }
     const int64_t R = resident(*p.k);
-    const int64_t S = sm_count();
-    const int64_t per_sm = std::max<int64_t>(1, R / S);
     const int cb = c.fmt == Format::Q8 ? p.k->ch : c.fmt == Format::Bf16 ? 2 * p.k->ch : p.k->ch / 2;   // weight bytes per row per chunk
     const double sums = 1.0 + 64.0 / cb;   // an item's fixed cost in chunks: its pipeline turn and its slice's sums
     double best = 1e30;
@@ -206,10 +204,7 @@ Plan plan_for(const Call& c) {
         // plus the tile's last block's walk over the slices' sums, about a quarter chunk a slice at 16 rows (40 slices
         // of a 256-row matrix cost 15.7 us at T = 16 against 7.7 at 10)
         const double tail = kse > 1 ? 0.25 * kse : 0.0;
-        // busiest SM runs ceil(items / S) blocks (more accurate than rounding up to whole R-block waves when tiles
-        // land between S and R, e.g. 80 tiles on 48 SMs where 32 SMs take 2 blocks and 16 take 1)
-        const double waves = (double) ((items + S - 1) / S) / (double) per_sm;
-        const double cost = waves * (cps + (kse > 1 ? sums : 0.0)) + tail;
+        const double cost = (double) ((items + R - 1) / R) * (cps + (kse > 1 ? sums : 0.0)) + tail;
         if (cost < best - 1e-9) {
             best = cost;
             p.ks = kse;

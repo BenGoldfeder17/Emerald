@@ -88,10 +88,13 @@ __device__ __forceinline__ Cand warp_merge_tree(Cand (&c)[n]) {
     return c[0];
 }
 
+// selectable by the original scan (finite or -inf; excludes NaN and +inf)
+__device__ __forceinline__ bool cand_selectable(float v) { return !isnan(v) && v <= FLT_MAX; }
+
 // Warp's first `top` (1 <= top <= 32) of its kPer x 32 values in registers, sorted in lane 0..top-1.
 // Uses the sorted lane maxima to find a threshold tau bounding the top-th element from below; when at most 32 valid
 // entries reach tau, compacts them into `buf` (32 entries) and runs one 32-wide bitonic sort; otherwise sorts and merges
-// all kPer sets of 32 (exact even with massive ties or all -inf).
+// all kPer sets of 32 (exact even with massive ties, NaN, +inf or all -inf).
 __device__ __forceinline__ Cand warp_first_k(const float (&x)[kPer], float wm, int tid, int i0, int n, int top, Cand* buf) {
     const int lane = tid & 31;
     const float sm = warp_sort32_values(wm);
@@ -99,7 +102,7 @@ __device__ __forceinline__ Cand warp_first_k(const float (&x)[kPer], float wm, i
         int cnt = 0;
 #pragma unroll
         for (int j = 0; j < kPer; ++j)
-            cnt += __popc(__ballot_sync(kFullMask, (tid + j * kThreads < n) && (x[j] >= tau)));
+            cnt += __popc(__ballot_sync(kFullMask, (tid + j * kThreads < n) && cand_selectable(x[j]) && (x[j] >= tau)));
         return cnt;
     };
     int lo = 0, hi = top - 1;
@@ -113,7 +116,7 @@ __device__ __forceinline__ Cand warp_first_k(const float (&x)[kPer], float wm, i
     int total = 0;
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
-        bal[j] = __ballot_sync(kFullMask, (tid + j * kThreads < n) && (x[j] >= tau));
+        bal[j] = __ballot_sync(kFullMask, (tid + j * kThreads < n) && cand_selectable(x[j]) && (x[j] >= tau));
         total += __popc(bal[j]);
     }
     if (total <= 32) {
@@ -134,7 +137,7 @@ __device__ __forceinline__ Cand warp_first_k(const float (&x)[kPer], float wm, i
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
         const int idx = tid + j * kThreads;
-        c[j] = idx < n ? Cand{x[j], i0 + idx} : Cand{-INFINITY, kSentinelId};
+        c[j] = (idx < n && cand_selectable(x[j])) ? Cand{x[j], i0 + idx} : Cand{-INFINITY, kSentinelId};
         c[j] = warp_sort32(c[j]);
     }
     return warp_merge_tree<kPer>(c);
@@ -161,7 +164,7 @@ __device__ void chunk_stage(const float* __restrict__ logits, int n_vocab, int t
             const float v = src[idx];
             x[j] = v;
             mx = fmaxf(mx, v);
-            wm = fmaxf(wm, v);
+            if (cand_selectable(v)) wm = fmaxf(wm, v);
         } else {
             x[j] = -INFINITY;
         }

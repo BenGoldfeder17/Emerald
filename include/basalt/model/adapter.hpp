@@ -171,6 +171,8 @@ public:
     /// Whether the engine may fill a window with prompt-lookup drafts (CommonOptions::suffix_draft) in place of the
     /// drafter's: any window's rows are verified the same way, so only speed changes.
     virtual bool copy_drafts() const { return false; }
+    /// True when verifying up to an 8-row tile costs nearly the same as 1 row (single-GPU, non-KV-streamed block drafter).
+    virtual bool flat_draft_cost() const { return false; }
     /// Starts `n` drafts (at most max_window() - 1) after `anchor`, the token at position `pos`. The rows of the last window
     /// before `pos` were accepted.
     virtual Result draft_begin(int32_t anchor, int64_t pos, int n) { (void) anchor; (void) pos; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }

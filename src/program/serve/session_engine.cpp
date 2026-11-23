@@ -50,9 +50,9 @@ public:
             basalt::log::error("basalt serve", "the model has %zu sessions for %d slots", sessions_.size(), std::max(o.batch, 1));
             return 1;
         }
-        // one policy for the solo windows and one for the batch windows, whose rounds cost differently
-        // dense GPU-resident models (slots_share_cells) stream the same weights across an 8-row tile (flat_cost)
-        const bool dense_cost = slots_share_cells();
+        // one policy for the solo windows and one for the batch windows, whose rounds cost differently;
+        // single-GPU, non-KV-streamed dense block-drafter models stream the same weights across an 8-row tile (flat_cost)
+        const bool dense_cost = session().flat_draft_cost();
         policy.emplace(session().max_window(), 0.03, true, dense_cost);
         bpolicy.emplace(session().max_window(), 0.03, true, dense_cost);
         if (lookup_on()) sfx.emplace(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
